@@ -1,9 +1,13 @@
 // Fakes for the thin interfaces (CONVENTIONS.md): Slack port, clock, engines, and a seeded world.
 // Used by tests and by scripts/e2e.ts. No network.
 
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { after } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { Core, type CoreOptions, type ResearchDefault } from '../src/core.ts';
+import { type ClientHints, Core, type CoreOptions, type ResearchDefault } from '../src/core.ts';
 import { type Engine, EngineError, type TurnRequest, type TurnResult } from '../src/engines.ts';
 import { openDb } from '../src/db.ts';
 import type { Block, SlackPort, SlackPost } from '../src/slack.ts';
@@ -62,9 +66,22 @@ export function world(researchDefault: ResearchDefault = 'deny', options: Omit<C
 
 export const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
 
-export async function mcpClient(url: string, token: string): Promise<Client> {
+/** A temp dir, removed when the test (or suite, or file) that made it ends: /tmp may be RAM. */
+export function tempDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+/** Session n's id, as Claude Code makes them (a uuid). */
+export const sid = (n: number): string => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+/** What a Claude client says about session n on a request: its key and its presence (core.forAgent's hints). */
+export const hint = (n: number, presence: Record<string, unknown> = {}, extra: ClientHints = {}): ClientHints =>
+  ({ session: `claude:${sid(n)}`, presence: encodeURIComponent(JSON.stringify(presence)), ...extra });
+
+export async function mcpClient(url: string, token: string, headers: Record<string, string> = {}): Promise<Client> {
   const client = new Client({ name: 'test', version: '1' });
-  await client.connect(new StreamableHTTPClientTransport(new URL(`${url}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${url}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${token}`, ...headers } } }));
   return client;
 }
 

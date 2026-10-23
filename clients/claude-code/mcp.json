@@ -1,9 +1,10 @@
 {
   "mcpServers": {
     "switchboard": {
-      "type": "http",
-      "url": "${SWITCHBOARD_URL}/mcp",
-      "headers": { "Authorization": "Bearer ${SWITCHBOARD_TOKEN}" }
+      "type": "stdio",
+      "command": "node",
+      "args": ["${HOME}/.config/switchboard/switchboard.mjs", "mcp"],
+      "env": { "SWITCHBOARD_ENV_FILE": "${HOME}/.config/switchboard/env" }
     }
   }
 }

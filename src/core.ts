@@ -48,7 +48,55 @@ export interface CoreEvent {
   body: Record<string, unknown>;
   created_at: string;
 }
-export interface Delivery { recipient: string; priority: Priority; kind?: string }
+/**
+ * An inbox row to write. For an agent it targets one of its sessions: `session` when the sender named one (an address),
+ * else the routing rule (Core.target) with `prefer` (the session that asked or queued it) or the thread's route as its first choice.
+ */
+export interface Delivery { recipient: string; priority: Priority; kind?: string; session?: number; prefer?: number | undefined }
+
+export type SessionStatus = 'busy' | 'idle' | 'waiting';
+/** One live client of an agent's token (docs/design/core.md, "Sessions"). What its client says about it is a hint, never authority. */
+export interface Session {
+  id: number;
+  agent_id: string;
+  key: string;
+  /** Unique among the agent's current sessions; null once gone. Its address is `<agent>@<name>`. */
+  name: string | null;
+  host: string | null;
+  cwd: string | null;
+  repo: string | null;
+  branch: string | null;
+  title: string | null;
+  status: SessionStatus | null;
+  by_client: number;
+  hooks: number;
+  polled_at: string | null;
+  waited_at: string | null;
+  active_at: string;
+  seen_at: string;
+}
+/**
+ * What a request says about the session it comes from, raw: X-Switchboard-Session / -Host / -Presence, Codex's
+ * _meta.threadId, a hook's params. Core.touchSession checks each for length and charset.
+ */
+export interface ClientHints {
+  session?: string | null;
+  thread?: string | null;
+  host?: string | null;
+  /** Percent-encoded JSON: {cwd, repo, branch, status, title}. */
+  presence?: string | null;
+  cwd?: string | null;
+  repo?: string | null;
+  branch?: string | null;
+  /** A hook's event: UserPromptSubmit (busy), Stop (idle). */
+  event?: string | null;
+  /** A Codex client's X-Switchboard-Threads: the thread ids it forwarded tool calls for, comma-separated (its /wait reaches only those). */
+  threads?: string | null;
+  /** A /wait poll: online, and a client can wake it. Not activity. */
+  poll?: boolean;
+}
+/** How a session sees mail sent to it: woken now or already waiting (push), when its turn ends (turn), when it checks (pull). */
+export interface Delivered { to: string; tier: 'push' | 'turn' | 'pull' }
 /**
  * P3: an agent's question for a human, waiting for the ops agent to present it (`text` is its words on the card, which
  * shows the agent's own options as buttons), drop it, or for it to expire.
@@ -64,6 +112,8 @@ export interface Ask {
   card_thread: string | null;
   created_at: string;
   handled_at: string | null;
+  /** The session that asked, which its presentation and answer go to (reply routing). */
+  session: number | null;
 }
 /** P2, P3: a presented ask is one line on its card. */
 export const ASK_TEXT_MAX = 300;
@@ -82,6 +132,7 @@ export interface SendResult {
   ask?: string;
   note?: string;
   not_delivered?: { muted: string[]; relayed: string[] };
+  delivery?: Delivered;
 }
 /** P3: an agent's words for a human, waiting for the ops agent to tell them (tell_human, respond) or skip them (do_not_respond). */
 export interface HumanItem {
@@ -94,9 +145,11 @@ export interface HumanItem {
   outcome: string | null;
   created_at: string;
   handled_at: string | null;
+  /** The session that wrote it, which the ops agent's post about it and the human's replies go to (reply routing). */
+  session: number | null;
 }
 
-export type ErrorCode = 'not_found' | 'forbidden' | 'invalid' | 'conflict' | 'muted';
+export type ErrorCode = 'not_found' | 'forbidden' | 'invalid' | 'conflict' | 'muted' | 'loop_guard';
 // Messages go straight back to agents and humans, so they say what to do instead.
 export class SwitchboardError extends Error {
   code: ErrorCode;
@@ -113,6 +166,30 @@ export const MAX_AGENT_NOTE = 1000;
 const PRINCIPAL_ID = /^[a-z][a-z0-9-]{0,31}$/;
 const AGENT_NAME = /^[a-z0-9][a-z0-9._-]{0,47}$/;
 const TOKEN_PREFIX = 'sb_';
+
+// Sessions (docs/design/core.md). Online: polled /wait or held wait_for_message this recently. A session keeps its name
+// while seen within KEEP; one no client ever polled for (headless) only within HEADLESS.
+const ONLINE_MS = 2 * 60_000;
+const KEEP_MS = 24 * 60 * 60_000;
+const HEADLESS_MS = 15 * 60_000;
+/** A session whose wake client hasn't polled for this long is closed: its mail moves on, though it keeps its name. */
+const CLOSED_MS = 10 * 60_000;
+const SESSION_KEY = /^(claude|codex):[0-9a-f-]{8,64}$/i;
+const THREAD_ID = /^[0-9a-f-]{8,64}$/i;
+/** A switchboard thread's id as a hook names it: newId's form, t_… or w_…. */
+const ROUTE_THREAD = /^[tw]_[a-z0-9]{6,40}$/;
+const HOST = /^[A-Za-z0-9._-]+$/;
+const PRINTABLE = /^[^\u0000-\u001f\u007f]+$/;
+const DIR_NAME = /^[^\u0000-\u001f\u007f/\\]+$/;
+/** A client's hint if it is text of at most `max` characters matching `re`, else nothing: a bad hint never fails a request. */
+const hintOf = (v: unknown, max: number, re = PRINTABLE): string | null => (typeof v === 'string' && v.length <= max && re.test(v) ? v : null);
+/** X-Switchboard-Threads: at most 32 thread ids, each checked; the rest is dropped. */
+const threadsOf = (v: unknown): string[] =>
+  hintOf(v, 4096)?.split(',').map((t) => t.trim()).filter((t) => THREAD_ID.test(t)).slice(0, 32).map((t) => t.toLowerCase()) ?? [];
+// Loop guard: at most this many agent-written messages in the window from one sender to one recipient, and per sending agent.
+const LOOP_WINDOW_MS = 10 * 60_000;
+const LOOP_PAIR_MAX = 12;
+const LOOP_AGENT_MAX = 60;
 
 export const sha256 = (s: string): string => createHash('sha256').update(s).digest('hex');
 export const newId = (prefix: string): string => `${prefix}_${randomBytes(6).toString('hex')}`;
@@ -146,6 +223,22 @@ export function checkBody(body: unknown, what = 'body'): string {
   return body;
 }
 
+/**
+ * What a client says about its session (X-Switchboard-Presence, else a hook's params), each field checked; the rest is
+ * dropped. `reported`: the client sent a presence object, so a missing status means it no longer reads one.
+ */
+function presenceOf(h: ClientHints) {
+  let p: unknown = null;
+  try { p = JSON.parse(decodeURIComponent(hintOf(h.presence, 4000) ?? '')); } catch { /* not percent-encoded JSON: ignored */ }
+  const reported = p !== null && typeof p === 'object' && !Array.isArray(p);
+  const v = (reported ? p : {}) as Record<string, unknown>;
+  const status = v['status'];
+  return {
+    reported, cwd: hintOf(v['cwd'] ?? h.cwd, 500), repo: hintOf(v['repo'] ?? h.repo, 100, DIR_NAME), branch: hintOf(v['branch'] ?? h.branch, 200),
+    status: status === 'busy' || status === 'idle' || status === 'waiting' ? status : null, title: hintOf(v['title'], 200),
+  };
+}
+
 export interface CoreOptions {
   now?: () => Date;
   researchDefault?: ResearchDefault;
@@ -164,6 +257,10 @@ export class Core {
   readonly askExpiryMinutes: number;
   private listeners: Listener[] = [];
   private waiters = new Map<string, Set<() => void>>();
+  /** Sessions holding wait_for_message now (how many calls each): online, idle, and handed their mail directly. */
+  private holding = new Map<number, number>();
+  /** The loop guard's window: agents' own messages, newest last. In memory: a restart only forgets ten minutes of it. */
+  private sent: Array<{ at: number; agent: string; sender: string; to: string[] }> = [];
 
   constructor(db: Db, options: CoreOptions = {}) {
     this.db = db;
@@ -425,18 +522,18 @@ export class Core {
 
   // ---- P3: what agents write for humans, through the ops agent ----
 
-  /** One item per human for an agent's event the ops agent reads. */
-  addHumanItems(event: CoreEvent, principals: string[]): string[] {
+  /** One item per human for an agent's event the ops agent reads; `session`: the agent's session that wrote it. */
+  addHumanItems(event: CoreEvent, principals: string[], session: number | null = null): string[] {
     const from = event.actor.slice('agent:'.length);
     return principals.map((p) => {
       const id = newId('m');
-      run(this.db, 'INSERT INTO human_items (id, principal, from_agent, thread_id, event_seq, created_at) VALUES (?, ?, ?, ?, ?, ?)', id, p, from, event.thread_id, event.seq, this.iso());
+      run(this.db, 'INSERT INTO human_items (id, principal, from_agent, thread_id, event_seq, created_at, session) VALUES (?, ?, ?, ?, ?, ?, ?)', id, p, from, event.thread_id, event.seq, this.iso(), session);
       return id;
     });
   }
-  addAsk(event: CoreEvent, principal: string): string {
+  addAsk(event: CoreEvent, principal: string, session: number | null = null): string {
     const id = newId('q');
-    run(this.db, 'INSERT INTO asks (id, principal, from_agent, thread_id, event_seq, created_at) VALUES (?, ?, ?, ?, ?, ?)', id, principal, event.actor.slice('agent:'.length), event.thread_id, event.seq, this.iso());
+    run(this.db, 'INSERT INTO asks (id, principal, from_agent, thread_id, event_seq, created_at, session) VALUES (?, ?, ?, ?, ?, ?, ?)', id, principal, event.actor.slice('agent:'.length), event.thread_id, event.seq, this.iso(), session);
     return id;
   }
   humanItem(id: string): HumanItem | undefined {
@@ -503,7 +600,7 @@ export class Core {
       // The asker sees how its question was put, in one line (deferred: nothing to do yet).
       return this.append(card.id, 'ops', 'ask_presented',
         { ask: id, who: ask.principal, text: text.trim(), options: q.body['options'] ?? [], ask_thread: ask.thread_id, ask_seq: ask.event_seq, note: `presented to ${ask.principal} as: ${text.trim()}` },
-        [{ recipient: agentActor(ask.from_agent), priority: 'deferred' }]);
+        [{ recipient: agentActor(ask.from_agent), priority: 'deferred', prefer: ask.session ?? undefined }]);
     });
   }
 
@@ -524,7 +621,7 @@ export class Core {
   private askNotPresented(ask: Ask, state: 'skipped' | 'expired', text: string): CoreEvent {
     run(this.db, 'UPDATE asks SET state = ?, handled_at = ? WHERE id = ?', state, this.iso(), ask.id);
     return this.append(ask.thread_id, 'system', 'ask_not_presented', { ask: ask.id, who: ask.principal, ask_seq: ask.event_seq, state, text },
-      [{ recipient: agentActor(ask.from_agent), priority: 'steer' }]);
+      [{ recipient: agentActor(ask.from_agent), priority: 'steer', prefer: ask.session ?? undefined }]);
   }
 
   /** P3: the ops agent decides the human doesn't need the question (do_not_respond with its id). */
@@ -581,8 +678,11 @@ export class Core {
       run(this.db, 'INSERT INTO events (thread_id, seq, actor, type, body, created_at) VALUES (?, ?, ?, ?, ?, ?)',
         threadId, seq, actor, type, JSON.stringify(body), created_at);
       for (const d of deliveries) {
-        run(this.db, 'INSERT INTO inbox (recipient, thread_id, event_seq, priority, kind, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-          d.recipient, threadId, seq, d.priority, d.kind ?? 'message', created_at);
+        // One of the agent's sessions gets it (an address, else Core.target); none: any of its sessions reads it.
+        const agent = d.recipient.startsWith('agent:') ? d.recipient.slice('agent:'.length) : null;
+        const session = agent === null ? null : d.session ?? this.targetIn(threadId, agent, d.prefer);
+        run(this.db, 'INSERT INTO inbox (recipient, thread_id, event_seq, priority, kind, created_at, session) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          d.recipient, threadId, seq, d.priority, d.kind ?? 'message', created_at, session);
       }
       const event: CoreEvent = { thread_id: threadId, seq, actor, type, body, created_at };
       afterCommit(this.db, () => {
@@ -645,10 +745,14 @@ export class Core {
     return this.now().getTime() - Date.parse(last.created_at) > this.solicitedReplyHours * 3_600_000 ? 'expired' : 'open';
   }
 
-  /** Posts a message from any actor and delivers it per fanOut. Relayed-only recipients get a relay request. */
-  postMessage(thread: Thread, sender: string, body: Record<string, unknown>, extra: Delivery[] = []): { event: CoreEvent; muted: string[]; relayed: string[] } {
+  /**
+   * Posts a message from any actor and delivers it per fanOut. Relayed-only recipients get a relay request. `to`: the
+   * session one recipient's copy targets, when the sender addressed it (`<agent>@<session>`).
+   */
+  postMessage(thread: Thread, sender: string, body: Record<string, unknown>, extra: Delivery[] = [], to?: { recipient: string; session: number }): { event: CoreEvent; muted: string[]; relayed: string[] } {
     const { deliveries, muted, relayed } = this.fanOut(thread, sender);
-    const event = this.append(thread.id, sender, 'message', body, [...deliveries, ...extra]);
+    const addressed = deliveries.map((d) => (d.recipient === to?.recipient ? { ...d, session: to.session } : d));
+    const event = this.append(thread.id, sender, 'message', body, [...addressed, ...extra]);
     for (const actor of relayed) {
       this.queueRelay(sender.slice('agent:'.length), actor.slice('agent:'.length), String(body['text'] ?? ''));
     }
@@ -722,41 +826,38 @@ export class Core {
     // P3: only once the ops agent put it to them (an ask from before migration 14 has no row, and its old card still answers).
     const state = this.askByEvent(threadId, askSeq)?.state;
     if (state && state !== 'presented') throw new SwitchboardError('conflict', `this question was never put to you (it is ${state}).`);
-    // What the human answered is the ops agent's card, so the asker gets that line with the answer.
-    const presented = this.askByEvent(threadId, askSeq)?.text;
+    // What the human answered is the ops agent's card, so the asker gets that line with the answer, in the session that asked.
+    const { text: presented, session } = this.askByEvent(threadId, askSeq) ?? {};
     return tx(this.db, () => {
       // Asked directly, not through events(), whose default page would miss an answer past the thread's 1000th event.
       const answered = one(this.db, "SELECT 1 FROM events WHERE thread_id = ? AND type = 'human_answer' AND json_extract(body, '$.ask_seq') = ?", threadId, askSeq);
       if (answered) throw new SwitchboardError('conflict', 'this question was already answered.');
       run(this.db, 'UPDATE asks SET answered_at = ? WHERE thread_id = ? AND event_seq = ?', this.iso(), threadId, askSeq);
       return this.append(threadId, principalActor(principalId), 'human_answer', { ask_seq: askSeq, answer, ...(presented ? { presented_as: presented } : {}) },
-        ask.actor.startsWith('agent:') ? [{ recipient: ask.actor, priority: 'steer' }] : []);
+        ask.actor.startsWith('agent:') ? [{ recipient: ask.actor, priority: 'steer', prefer: session ?? undefined }] : []);
     });
   }
 
   // ---- inbox ----
 
-  unread(recipient: string): { unread: number; steer: number } {
-    const row = one<{ unread: number; steer: number | null }>(this.db,
-      "SELECT COUNT(*) AS unread, SUM(priority = 'steer') AS steer FROM inbox WHERE recipient = ? AND read_at IS NULL", recipient)!;
+  /** Unread mail for `recipient`; with `session`, only what that session reads: mail targeted at it, or at none. */
+  unread(recipient: string, session?: number | null): { unread: number; steer: number } {
+    const row = one<{ unread: number; steer: number | null }>(this.db, `SELECT COUNT(*) AS unread, SUM(priority = 'steer') AS steer FROM inbox
+      WHERE recipient = ? AND read_at IS NULL AND (? IS NULL OR session IS NULL OR session = ?)`, recipient, session ?? null, session ?? null)!;
     return { unread: Number(row.unread), steer: Number(row.steer ?? 0) };
   }
 
-  takeInbox(recipient: string, limit: number, threadId?: string): Array<{ id: number; thread_id: string; event_seq: number; priority: Priority; kind: string }> {
+  takeInbox(recipient: string, limit: number, session?: number | null): Array<{ id: number; thread_id: string; event_seq: number; priority: Priority; kind: string }> {
     return tx(this.db, () => {
-      const rows = threadId
-        ? all<{ id: number; thread_id: string; event_seq: number; priority: Priority; kind: string }>(this.db,
-          'SELECT id, thread_id, event_seq, priority, kind FROM inbox WHERE recipient = ? AND read_at IS NULL AND thread_id = ? ORDER BY id LIMIT ?', recipient, threadId, limit)
-        : all<{ id: number; thread_id: string; event_seq: number; priority: Priority; kind: string }>(this.db,
-          'SELECT id, thread_id, event_seq, priority, kind FROM inbox WHERE recipient = ? AND read_at IS NULL ORDER BY id LIMIT ?', recipient, limit);
+      const rows = all<{ id: number; thread_id: string; event_seq: number; priority: Priority; kind: string }>(this.db, `SELECT id, thread_id, event_seq, priority, kind FROM inbox
+        WHERE recipient = ? AND read_at IS NULL AND (? IS NULL OR session IS NULL OR session = ?) ORDER BY id LIMIT ?`, recipient, session ?? null, session ?? null, limit);
       for (const r of rows) run(this.db, 'UPDATE inbox SET read_at = ? WHERE id = ?', this.iso(), r.id);
       return rows;
     });
   }
 
-  /** Resolves when `recipient` has unread mail or the timeout passes. Mail is in the DB either way. */
-  waitForMail(recipient: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
-    if (this.unread(recipient).unread > 0) return Promise.resolve();
+  /** Resolves at the next mail or token change for `recipient` (notify), or when the timeout passes. Mail is in the DB either way. */
+  waitFor(recipient: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
     return new Promise((resolve) => {
       const set = this.waiters.get(recipient) ?? new Set();
       this.waiters.set(recipient, set);
@@ -771,6 +872,199 @@ export class Core {
     for (const wake of [...(this.waiters.get(recipient) ?? [])]) wake();
   }
 
+  // ---- sessions: per-session identity, routing and wake (docs/design/core.md) ----
+
+  /**
+   * The session a request comes from, created or refreshed from what its client says (ClientHints): its key (a header, a
+   * hook's param, or Codex's _meta.threadId), presence, host, a hook's event. Hints, each checked for length and charset,
+   * never authority: they only pick one of the authenticated agent's own sessions. A new one (or one back from gone) is
+   * named after its repo, else its cwd's basename, else its kind, with -2, -3 on a collision. No valid key: null.
+   */
+  touchSession(agentId: string, h: ClientHints): Session | null {
+    const given = hintOf(h.session, 80, SESSION_KEY) ?? (hintOf(h.thread, 64, THREAD_ID) ? `codex:${h.thread}` : null);
+    if (!given) return null;
+    const key = given.toLowerCase();
+    const kind = key.slice(0, key.indexOf(':'));
+    const p = presenceOf(h);
+    const hook = h.event === 'UserPromptSubmit' ? 'busy' : h.event === 'Stop' ? 'idle' : null;
+    return tx(this.db, () => {
+      const now = this.iso();
+      run(this.db, 'INSERT OR IGNORE INTO sessions (agent_id, key, active_at, seen_at) VALUES (?, ?, ?, ?)', agentId, key, now, now);
+      const s = one<Session>(this.db, 'SELECT * FROM sessions WHERE agent_id = ? AND key = ?', agentId, key)!;
+      let name = s.name;
+      if (name === null) {
+        this.freeNames(agentId);
+        const dir = p.repo ?? s.repo ?? (p.cwd ?? s.cwd)?.split('/').filter(Boolean).pop() ?? kind;
+        const base = dir.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^[.-]+|[.-]+$/g, '').slice(0, 40) || kind;
+        const taken = new Set(this.sessions(agentId).map((x) => x.name));
+        name = base;
+        for (let n = 2; taken.has(name); n++) name = `${base}-${n}`;
+      }
+      // The client's registry beats hook events (UserPromptSubmit: busy, Stop: idle), but only while the client reports a
+      // status: its presence without one ends that, its last word becomes unknown, and hooks count again.
+      const byClient = p.status ? 1 : p.reported ? 0 : s.by_client;
+      const status = p.status ?? (hook && !byClient ? hook : p.reported && s.by_client ? null : s.status);
+      run(this.db, `UPDATE sessions SET name = ?, host = COALESCE(?, host), cwd = COALESCE(?, cwd), repo = COALESCE(?, repo), branch = COALESCE(?, branch),
+        title = COALESCE(?, title), status = ?, by_client = ?, hooks = MAX(hooks, ?), polled_at = CASE WHEN ? THEN ? ELSE polled_at END,
+        active_at = CASE WHEN ? THEN active_at ELSE ? END, seen_at = ? WHERE id = ?`,
+      name, hintOf(h.host, 100, HOST), p.cwd, p.repo, p.branch, p.title, status, byClient, hook ? 1 : 0, h.poll ? 1 : 0, now, h.poll ? 1 : 0, now, now, s.id);
+      // A held /wait looks again: this session may be due a wake now.
+      if (status !== s.status || s.name === null) afterCommit(this.db, () => this.notify(agentActor(agentId)));
+      return this.sessionById(s.id)!;
+    });
+  }
+
+  sessionById(id: number): Session | undefined { return one<Session>(this.db, 'SELECT * FROM sessions WHERE id = ?', id); }
+  /** An agent's current sessions (every agent's without one), oldest first. */
+  sessions(agentId?: string): Session[] {
+    return agentId ? all<Session>(this.db, 'SELECT * FROM sessions WHERE agent_id = ? AND name IS NOT NULL ORDER BY id', agentId)
+      : all<Session>(this.db, 'SELECT * FROM sessions WHERE name IS NOT NULL ORDER BY id');
+  }
+  sessionByName(agentId: string, name: string): Session | undefined {
+    return one<Session>(this.db, 'SELECT * FROM sessions WHERE agent_id = ? AND name = ?', agentId, name.toLowerCase());
+  }
+
+  /** Frees the names of sessions gone unseen: 24 h, or 15 minutes for one no client ever polled /wait for (headless). */
+  private freeNames(agentId?: string): void {
+    const now = this.now().getTime();
+    run(this.db, `UPDATE sessions SET name = NULL WHERE name IS NOT NULL AND (? IS NULL OR agent_id = ?) AND seen_at < CASE WHEN polled_at IS NULL THEN ? ELSE ? END`,
+      agentId ?? null, agentId ?? null, new Date(now - HEADLESS_MS).toISOString(), new Date(now - KEEP_MS).toISOString());
+  }
+
+  /**
+   * The 30 s tick: frees gone sessions' names, and moves the unread mail of gone and closed sessions (a wake client that
+   * hasn't polled for 10 minutes) on by the rule new mail follows: to an online session, which may be woken, else to none,
+   * which any session reads. A closed session keeps its name, so it gets it back when it returns.
+   */
+  expireSessions(): void {
+    const closed = new Date(this.now().getTime() - CLOSED_MS).toISOString();
+    tx(this.db, () => {
+      this.freeNames();
+      for (const r of all<{ id: number; recipient: string; thread_id: string; session: number }>(this.db, `SELECT i.id, i.recipient, i.thread_id, i.session
+        FROM inbox i JOIN sessions s ON s.id = i.session WHERE i.read_at IS NULL AND (s.name IS NULL OR s.polled_at < ?)`, closed)) {
+        const to = this.targetIn(r.thread_id, r.recipient.slice('agent:'.length));
+        if (to === r.session) continue; // still its best session (it holds wait_for_message, say)
+        run(this.db, 'UPDATE inbox SET session = ? WHERE id = ?', to, r.id);
+        afterCommit(this.db, () => this.notify(r.recipient));
+      }
+    });
+  }
+
+  /** Online: a client polled /wait for it, or it held wait_for_message, in the last 2 minutes, or it holds one now. */
+  online(s: Session): boolean {
+    const since = new Date(this.now().getTime() - ONLINE_MS).toISOString();
+    return this.holding.has(s.id) || (s.polled_at ?? '') >= since || (s.waited_at ?? '') >= since;
+  }
+  /** A client polled /wait for it in the last 2 minutes, so it can be woken. */
+  private wakeable(s: Session): boolean { return (s.polled_at ?? '') >= new Date(this.now().getTime() - ONLINE_MS).toISOString(); }
+  /** Busy, or waiting on its human, unless it holds wait_for_message (then it is waiting for mail). */
+  busy(s: Session): boolean { return !this.holding.has(s.id) && (s.status === 'busy' || s.status === 'waiting'); }
+  /** What list_team shows: offline, busy, idle, waiting or unknown. */
+  statusOf(s: Session): string { return !this.online(s) ? 'offline' : this.holding.has(s.id) ? 'idle' : s.status ?? 'unknown'; }
+
+  /** A session starts (+1) or ends (-1) a wait_for_message. */
+  hold(sessionId: number, delta: 1 | -1): void {
+    const n = (this.holding.get(sessionId) ?? 0) + delta;
+    if (n > 0) this.holding.set(sessionId, n); else this.holding.delete(sessionId);
+    run(this.db, 'UPDATE sessions SET waited_at = ?, seen_at = ? WHERE id = ?', this.iso(), this.iso(), sessionId);
+  }
+
+  /**
+   * The session an agent's new mail targets: `prefer` (the session that last wrote in the thread, asked, or queued it) if
+   * it is online, else the most recently active online idle session, else the most recently active online busy one, else
+   * none (any of the agent's sessions reads it).
+   */
+  target(agentId: string, prefer?: number | null): Session | undefined {
+    const online = this.sessions(agentId).filter((s) => this.online(s)).sort((a, b) => b.active_at.localeCompare(a.active_at));
+    return online.find((s) => s.id === prefer) ?? online.find((s) => !this.busy(s)) ?? online[0];
+  }
+  /** Reply routing: the session that last wrote in a thread for its agent; null: none on purpose; undefined: no route. */
+  route(threadId: string, agentId: string): number | null | undefined {
+    return one<{ session: number | null }>(this.db, 'SELECT session FROM routes WHERE thread_id = ? AND agent_id = ?', threadId, agentId)?.session;
+  }
+  /** Where an agent's mail in a thread goes: `prefer` (who asked or queued it), else the thread's route, by `target`; untargeted where the route says none. */
+  private targetIn(threadId: string, agentId: string, prefer?: number): number | null {
+    const route = prefer ?? this.route(threadId, agentId);
+    return route === null ? null : this.target(agentId, route)?.id ?? null;
+  }
+  noteRoute(threadId: string, agentId: string, session: number | null): void {
+    run(this.db, 'INSERT INTO routes (thread_id, agent_id, session) VALUES (?, ?, ?) ON CONFLICT (thread_id, agent_id) DO UPDATE SET session = excluded.session', threadId, agentId, session);
+  }
+
+  /** Who got an event's mail: its inbox rows' recipients. */
+  recipients(threadId: string, seq: number): string[] {
+    return all<{ recipient: string }>(this.db, 'SELECT recipient FROM inbox WHERE thread_id = ? AND event_seq = ? ORDER BY id', threadId, seq).map((r) => r.recipient);
+  }
+  /** The newest inbox row's id: the rows one write adds come after it. */
+  lastInboxId(): number { return one<{ id: number | null }>(this.db, 'SELECT MAX(id) AS id FROM inbox')!.id ?? 0; }
+  /** The recipient of each row written after inbox row `id`: in a transaction, one write's deliveries (its message, relay requests and copies). */
+  recipientsSince(id: number): string[] {
+    return all<{ recipient: string }>(this.db, 'SELECT recipient FROM inbox WHERE id > ?', id).map((r) => r.recipient);
+  }
+  /**
+   * Where an event's mail for `recipient` went and how it is seen: push (its session is woken now, or holds
+   * wait_for_message), turn (busy, or it has hooks: when its turn ends), pull (when it checks). The ops agent wakes on
+   * its own rules (wake.ts). Another principal (`viewer`) sees the agent only, never its session.
+   */
+  delivery(threadId: string, seq: number, recipient: string, viewer: string): Delivered | undefined {
+    const row = one<{ session: number | null }>(this.db, 'SELECT session FROM inbox WHERE thread_id = ? AND event_seq = ? AND recipient = ?', threadId, seq, recipient);
+    if (!row) return undefined;
+    if (!recipient.startsWith('agent:')) return { to: recipient, tier: 'push' };
+    const agent = recipient.slice('agent:'.length);
+    const s = row.session === null ? undefined : this.sessionById(row.session);
+    const tier = !s ? 'pull' : this.holding.has(s.id) || (this.wakeable(s) && !this.busy(s)) ? 'push' : this.wakeable(s) || s.hooks ? 'turn' : 'pull';
+    return { to: s?.name && principalOf(recipient) === viewer ? `${agent}@${s.name}` : agent, tier };
+  }
+
+  /**
+   * The sessions a /wait poll can wake, marked online and wakeable: the client's own session, or, for a Codex client (no
+   * session header), the agent's codex sessions for the threads it names (X-Switchboard-Threads: those it forwarded tool
+   * calls for), so a thread whose Codex has closed is never kept online. Ids of no session of this agent are ignored.
+   */
+  reachable(agentId: string, sessionId: number | null, threads: string[]): Session[] {
+    const ids = sessionId !== null ? [sessionId] : threads
+      .map((t) => one<{ id: number }>(this.db, 'SELECT id FROM sessions WHERE agent_id = ? AND key = ? AND name IS NOT NULL', agentId, `codex:${t}`)?.id)
+      .filter((id): id is number => id !== undefined);
+    for (const id of ids) run(this.db, 'UPDATE sessions SET polled_at = ?, seen_at = ? WHERE id = ?', this.iso(), this.iso(), id);
+    return ids.map((id) => this.sessionById(id)!);
+  }
+  /**
+   * Claims a session's wake if one is due: it isn't busy, doesn't hold wait_for_message (which hands it its mail), and has
+   * unread mail targeted at it that it wasn't told about.
+   */
+  claimWake(s: Session): boolean { return !this.holding.has(s.id) && !this.busy(s) && this.tell(s.id) > 0; }
+  /**
+   * Marks a session told about its unread targeted mail (a returned wake, a hook's notice) and says how many messages were
+   * new to it. One INSERT claims them, per message and session, so each message wakes a session at most once, even after
+   * it moved away and back, and two clients never both wake it.
+   */
+  tell(sessionId: number): number {
+    return run(this.db, 'INSERT OR IGNORE INTO inbox_told (inbox_id, session) SELECT id, ? FROM inbox WHERE session = ? AND read_at IS NULL', sessionId, sessionId).changes;
+  }
+  /** Unread mail targeted at the session itself. */
+  targeted(sessionId: number): number {
+    return Number(one<{ n: number }>(this.db, 'SELECT COUNT(*) AS n FROM inbox WHERE session = ? AND read_at IS NULL', sessionId)!.n);
+  }
+
+  /**
+   * Loop guard: refuses an agent's message that takes one sender (its session, else the agent) past 12 deliveries to one
+   * recipient, or the agent past 60 messages, in 10 minutes. `to`: the message's deliveries, one per inbox row, so two
+   * relay requests to the ops agent count twice. Called for agents' own messages only, inside their write, so a refusal
+   * rolls it back; what humans, switchboard and the ops agent write never counts.
+   */
+  loopGuard(agentId: string, sender: string, to: string[]): void {
+    const now = this.now().getTime();
+    this.sent = this.sent.filter((m) => m.at > now - LOOP_WINDOW_MS);
+    const flooded = this.sent.filter((m) => m.agent === agentId).length >= LOOP_AGENT_MAX;
+    const times = (r: string, list: string[]) => list.filter((x) => x === r).length;
+    const pair = to.find((r) => this.sent.reduce((n, m) => n + (m.sender === sender ? times(r, m.to) : 0), times(r, to)) > LOOP_PAIR_MAX);
+    if (flooded || pair) {
+      const who = pair === 'ops' ? 'the ops agent' : pair?.slice('agent:'.length);
+      throw new SwitchboardError('loop_guard', `refused: ${flooded ? 'you have sent' : `you and ${who} have exchanged`} many messages in the last few minutes, which looks like a loop. Check with your human before continuing.`);
+    }
+    this.sent.push({ at: now, agent: agentId, sender, to });
+  }
+
   /** Agents with unread mail older than `minutes` that nobody has pinged their human about yet. */
   staleInbox(minutes: number): Array<{ recipient: string; count: number }> {
     const cutoff = new Date(this.now().getTime() - minutes * 60_000).toISOString();
@@ -782,7 +1076,7 @@ export class Core {
     run(this.db, 'UPDATE inbox SET pinged_at = ? WHERE recipient = ? AND read_at IS NULL AND pinged_at IS NULL', this.iso(), recipient);
   }
 
-  /** Plan §10: an idle agent can't be woken, so after `minutes` undelivered, tell its human (once per batch). */
+  /** Plan §10: mail no session read or was woken for in `minutes` (none was online, say), so tell its human (once per batch). */
   pingIdleAgents(minutes: number): CoreEvent[] {
     const out: CoreEvent[] = [];
     for (const { recipient, count } of this.staleInbox(minutes)) {
@@ -806,7 +1100,10 @@ export class Core {
     run(this.db, 'INSERT INTO audit (at, actor, action, detail) VALUES (?, ?, ?, ?)', this.iso(), actor, action, detail === undefined ? null : JSON.stringify(detail));
   }
 
-  forAgent(agent: Agent): AgentSession { return new AgentSession(this, agent); }
+  /** What one agent may do; with hints, as the client session they name (touchSession), else as the whole agent. */
+  forAgent(agent: Agent, hints?: ClientHints): AgentSession {
+    return new AgentSession(this, agent, hints ? this.touchSession(agent.id, hints) : null, threadsOf(hints?.threads));
+  }
 
   /** Renders a thread as markdown (admin export, plan §12). */
   exportThread(threadId: string): string {
@@ -825,12 +1122,21 @@ export class AgentSession {
   readonly core: Core;
   readonly agent: Agent;
   readonly actor: string;
+  /** The client session the request comes from (Core.touchSession), or null: then it acts for the whole agent, as before sessions. */
+  readonly session: Session | null;
+  /** The Codex threads the client names (X-Switchboard-Threads): a Codex client's /wait reaches only those. */
+  readonly threads: string[];
 
-  constructor(core: Core, agent: Agent) {
+  constructor(core: Core, agent: Agent, session: Session | null = null, threads: string[] = []) {
     this.core = core;
     this.agent = agent;
     this.actor = agentActor(agent.id);
+    this.session = session;
+    this.threads = threads;
   }
+
+  /** `<agent>@<session>`, when the session is known. */
+  get address(): string | undefined { return this.session?.name ? `${this.agent.id}@${this.session.name}` : undefined; }
 
   /** Own principal's threads (except DMs with the ops agent), and shared threads it or its principal is in. */
   canRead(thread: Thread): boolean {
@@ -857,6 +1163,7 @@ export class AgentSession {
     const deaf = mutes.filter((m) => m.muted_principal_id === p && m.mode === 'all').map((m) => m.principal_id);
     return {
       agent: this.agent.id,
+      ...(this.address ? { session: this.address } : {}),
       principal: p,
       mutes: {
         your_principal_mutes: mutes.filter((m) => m.principal_id === p).map((m) => ({ principal: m.muted_principal_id, mode: m.mode })),
@@ -870,7 +1177,7 @@ export class AgentSession {
           ` When one of them writes to you, you can reply in that thread; the asker hears you, for ${this.core.solicitedReplyHours} hours after it last wrote to you with send_message.` +
           deaf.map((o) => ` Anywhere else ${o} mutes ${p}'s agents: answer ${o} (send_message(to: '${o}')) instead.`).join('') } : {}),
       } : null,
-      ...this.core.unread(this.actor),
+      ...this.counts(),
     };
   }
 
@@ -888,22 +1195,27 @@ export class AgentSession {
 
   sendMessage(to: string, body: string, threadId?: string): SendResult {
     checkBody(body);
-    const text = body;
+    return this.guarded(() => this.send(to, body, threadId));
+  }
+
+  private send(to: string, text: string, threadId?: string): SendResult {
+    const at = to.indexOf('@');
     if (to === 'ops') {
       const thread = threadId ? this.postable(threadId, 'shared') : this.pairThread('ops', 'shared', `${this.agent.id} ↔ ops agent`, true);
       this.core.join(thread.id, this.actor);
       this.core.join(thread.id, 'ops');
       const { event } = this.core.postMessage(thread, this.actor, { text, to: 'ops' }); // wakes the ops agent (wake.ts)
-      return { status: 'delivered', to: 'ops', thread: thread.id, seq: event.seq };
+      return { status: 'delivered', to: 'ops', thread: thread.id, seq: event.seq, ...this.delivered(thread.id, event.seq, 'ops') };
     }
-    const human = this.core.principal(to);
+    const human = at < 0 ? this.core.principal(to) : undefined;
     if (human) {
       const own = human.id === this.agent.principal_id;
       const delegate = own ? undefined : this.core.delegate(human.id);
       if (delegate) return this.toDelegate(human, delegate, 'send_message', { text }, threadId);
       return this.forHuman(human, text, threadId);
     }
-    const recipient = this.resolveAgent(to);
+    const recipient = this.resolveAgent(at < 0 ? to : to.slice(0, at));
+    const session = at < 0 ? undefined : this.sessionOf(recipient, to.slice(at + 1));
     if (recipient.id === this.agent.id) throw new SwitchboardError('invalid', 'you cannot message yourself.');
     const cross = recipient.principal_id !== this.agent.principal_id;
     // P4: a thread where the recipient asked this side is open to the reply, whatever its principal mutes.
@@ -921,14 +1233,56 @@ export class AgentSession {
       if (mode === 'relayed_only') {
         const event = this.core.queueRelay(this.agent.id, recipient.id, text);
         return { status: 'queued_for_relay', to: recipient.id, thread: event.thread_id, seq: event.seq,
-          note: `${recipient.principal_id} takes messages from your principal only through the ops agent. It decides whether and how to pass this on.` };
+          note: `${recipient.principal_id} takes messages from your principal only through the ops agent. It decides whether and how to pass this on.`,
+          ...this.delivered(event.thread_id, event.seq, 'ops') };
       }
     }
     const visibility = cross ? 'shared' : privateTo(this.agent.principal_id);
     const thread = asked ?? (threadId ? this.postable(threadId, visibility) : this.pairThread(agentActor(recipient.id), visibility, `${this.agent.id} ↔ ${recipient.id}`, true));
     this.core.join(thread.id, agentActor(recipient.id));
-    const { event, muted, relayed } = this.core.postMessage(thread, this.actor, { text, to: recipient.id });
-    return { status: 'delivered', to: recipient.id, thread: thread.id, seq: event.seq, ...(muted.length || relayed.length ? { not_delivered: { muted, relayed } } : {}) };
+    const { event, muted, relayed } = this.core.postMessage(thread, this.actor, { text, to: recipient.id }, [],
+      session === undefined ? undefined : { recipient: agentActor(recipient.id), session });
+    return { status: 'delivered', to: recipient.id, thread: thread.id, seq: event.seq, ...(muted.length || relayed.length ? { not_delivered: { muted, relayed } } : {}),
+      ...this.delivered(thread.id, event.seq, agentActor(recipient.id)) };
+  }
+
+  /**
+   * An address's session (`<agent>@<session>`): only one of your own principal's. Another principal's sessions are private
+   * to it, and its refusal is the same whether the session exists or not.
+   */
+  private sessionOf(recipient: Agent, name: string): number {
+    if (recipient.principal_id !== this.agent.principal_id) {
+      throw new SwitchboardError('forbidden', `address ${recipient.id}, not one of its sessions: another principal's sessions are private to it, and replies reach the right session on their own.`);
+    }
+    const s = this.core.sessionByName(recipient.id, name);
+    if (!s) throw new SwitchboardError('not_found', `${recipient.id} has no session '${name}' now. Call list_team to see your principal's sessions, or address ${recipient.id} itself.`);
+    return s.id;
+  }
+
+  /** `delivery` for a result: how `recipient` sees this event's mail (Core.delivery), when it got any. */
+  private delivered(threadId: string, seq: number, recipient: string): { delivery?: Delivered } {
+    const d = this.core.delivery(threadId, seq, recipient, this.agent.principal_id);
+    return d ? { delivery: d } : {};
+  }
+
+  /**
+   * An agent's own message (send_message, post, ask_human): written whole or not at all, its thread noted as this session's
+   * for replies (reply routing), and held to the loop guard, counting everyone it reached: its own recipients, and the
+   * ops agent for a relay request or a copy it made. A refusal is audited after the rollback, so the row stays.
+   */
+  private guarded<T extends { thread: string; seq: number }>(write: () => T): T {
+    try {
+      return tx(this.core.db, () => {
+        const before = this.core.lastInboxId();
+        const r = write();
+        if (this.session) this.core.noteRoute(r.thread, this.agent.id, this.session.id);
+        this.core.loopGuard(this.agent.id, this.session ? `${this.agent.id}@${this.session.id}` : this.agent.id, this.core.recipientsSince(before));
+        return r;
+      });
+    } catch (err) {
+      if (err instanceof SwitchboardError && err.code === 'loop_guard') this.core.audit(this.actor, 'loop_guard', { session: this.address ?? null, refused: err.message });
+      throw err;
+    }
   }
 
   /**
@@ -938,6 +1292,10 @@ export class AgentSession {
    */
   post(threadId: string, body: string) {
     checkBody(body);
+    return this.guarded(() => this.postIn(threadId, body));
+  }
+
+  private postIn(threadId: string, body: string) {
     const thread = this.readable(threadId);
     if (thread.state !== 'open') throw new SwitchboardError('conflict', `thread ${thread.id} is ${thread.state}; start a new one with send_message.`);
     const shared = thread.visibility === 'shared';
@@ -946,11 +1304,14 @@ export class AgentSession {
     return tx(this.core.db, () => {
       this.core.join(thread.id, this.actor);
       const { event, muted, relayed } = this.core.postMessage(thread, this.actor, { text: body, ...(shared && humans.length ? { for_human: humans } : {}) });
-      const items = !humans.length ? [] : shared ? this.core.addHumanItems(event, humans)
-        : this.core.addHumanItems(this.core.append(this.core.dmThread(humans[0]!).id, this.actor, 'message', { text: body, to: humans[0], for_human: humans, tool: 'post', re_thread: thread.id }), humans);
+      const delivery = this.core.recipients(thread.id, event.seq).map((r) => this.core.delivery(thread.id, event.seq, r, this.agent.principal_id)!);
+      const session = this.session?.id ?? null;
+      const items = !humans.length ? [] : shared ? this.core.addHumanItems(event, humans, session)
+        : this.core.addHumanItems(this.core.append(this.core.dmThread(humans[0]!).id, this.actor, 'message', { text: body, to: humans[0], for_human: humans, tool: 'post', re_thread: thread.id }), humans, session);
       return { status: 'posted', thread: thread.id, seq: event.seq, slack: false,
         ...(humans.length ? { for_human: humans, items, note: `${humans.join(' and ')} ${humans.length > 1 ? 'are' : 'is'} in this thread, but no human reads your words directly: the ops agent does, and tells them what they need to know.` } : {}),
-        ...(muted.length || relayed.length ? { not_delivered: { muted, relayed } } : {}) };
+        ...(muted.length || relayed.length ? { not_delivered: { muted, relayed } } : {}),
+        ...(delivery.length ? { delivery } : {}) };
     });
   }
 
@@ -962,16 +1323,16 @@ export class AgentSession {
     }
     const own = human.id === this.agent.principal_id;
     const delegate = own ? undefined : this.core.delegate(human.id);
-    if (delegate) return this.toDelegate(human, delegate, 'ask_human', { text: question, options });
+    if (delegate) return this.guarded(() => this.toDelegate(human, delegate, 'ask_human', { text: question, options }));
     if (!human.slack_user_id) throw new SwitchboardError('conflict', `${human.id} has no Slack user configured, so they can't be asked.`);
     // P3: no card yet. The question waits for the ops agent, which puts it to the human in its own words with these
     // options as buttons (present_ask). Its own human's, in their DM with the ops agent; the other's, in this agent's
     // shared thread with it.
-    return tx(this.core.db, () => {
+    return this.guarded(() => {
       const thread = own ? this.core.dmThread(human.id) : this.pairThread('ops', 'shared', `${this.agent.id} ↔ ops agent`, true);
       if (!own) this.core.join(thread.id, 'ops');
       const event = this.core.append(thread.id, this.actor, 'ask_human', { who: human.id, question, options });
-      const ask = this.core.addAsk(event, human.id);
+      const ask = this.core.addAsk(event, human.id, this.session?.id ?? null);
       return { status: 'asked', to: human.id, via: 'the ops agent', ask, thread: thread.id, seq: event.seq,
         note: `Waiting for the ops agent: the ops agent puts it to ${human.id} as a card, in its own words, with your options as buttons. ` +
           'The answer arrives in your inbox (read_inbox or wait_for_message). If it isn\'t presented in time, you\'re told "not presented".' };
@@ -994,11 +1355,12 @@ export class AgentSession {
       const thread = own ? this.core.dmThread(human.id) : this.pairThread('ops', 'shared', `${this.agent.id} ↔ ops agent`, true);
       if (!own) this.core.join(thread.id, 'ops');
       const event = own ? this.core.append(thread.id, this.actor, 'message', body) : this.core.postMessage(thread, this.actor, body).event;
-      const [item] = this.core.addHumanItems(event, [human.id]);
+      const [item] = this.core.addHumanItems(event, [human.id], this.session?.id ?? null);
       return {
         status: 'delivered', to: human.id, via: 'the ops agent', item, thread: thread.id, seq: event.seq,
         note: `Delivered to the ops agent, who tells ${human.id} in plain words what they need to know. No human reads your words directly: write the facts plainly for it.` +
           (own ? ` It waits in ${human.id}'s DM with the ops agent, which agents can't read.` : ''),
+        ...this.delivered(thread.id, event.seq, 'ops'),
       };
     });
   }
@@ -1029,13 +1391,14 @@ export class AgentSession {
       note: tool === 'ask_human'
         ? `This question went to ${human.id}'s delegate agent ${delegate.id}, not to ${human.id} in Slack: no card, no buttons. Any answer comes from that agent as a message in your inbox, not a button.${answer}`
         : `No human saw this: ${human.id} named ${delegate.id} their delegate, so what other principals' agents address to ${human.id} goes to its inbox. It answers you, or asks ${human.id} itself if it needs them.${answer}`,
+      ...this.delivered(thread.id, event.seq, agentActor(delegate.id)),
     };
   }
 
   readInbox(limit = 20) {
     return tx(this.core.db, () => {
       this.requireLiveToken();
-      const rows = this.core.takeInbox(this.actor, Math.min(Math.max(1, limit), 100));
+      const rows = this.core.takeInbox(this.actor, Math.min(Math.max(1, limit), 100), this.session?.id);
       return rows.map((r) => this.wrap(r.thread_id, r.event_seq, r.priority));
     });
   }
@@ -1053,10 +1416,84 @@ export class AgentSession {
   }
 
   async waitForMessage(timeoutS: number, signal?: AbortSignal) {
-    const seconds = Math.min(Math.max(1, timeoutS), 600);
-    await this.core.waitForMail(this.actor, seconds * 1000, signal);
+    const end = Date.now() + Math.min(Math.max(1, timeoutS), 600) * 1000;
+    // A session waiting for mail is online and idle, so its agent's new mail targets it (Core.target).
+    if (this.session) this.core.hold(this.session.id, 1);
+    try {
+      while (this.counts().unread === 0 && Date.now() < end && !signal?.aborted) {
+        await this.core.waitFor(this.actor, end - Date.now(), signal);
+        this.requireLiveToken();
+      }
+    } finally {
+      if (this.session) this.core.hold(this.session.id, -1);
+    }
     const items = this.readInbox(20);
     return items.length ? { items } : { items, timed_out: true };
+  }
+
+  /** The unread counts this caller sees: its session's mail (targeted at it, or at none), else all of its agent's. */
+  counts(): { unread: number; steer: number } { return this.core.unread(this.actor, this.session?.id); }
+  /** A session's unread counts when it has mail, which every tool result but the inbox's own carries. */
+  inboxNote(): { unread: number; steer: number } | undefined {
+    const c = this.session ? this.counts() : undefined;
+    return c?.unread ? c : undefined;
+  }
+
+  /**
+   * GET /unread, for a hook. With a session: its counts, plus `targeted` (mail for it alone, which blocks its Stop), and the
+   * notice the hook then shows (UserPromptSubmit's context, a Stop block) tells the session, so no wake repeats it.
+   * PostToolUse with a `thread` (Claude Code's, after a switchboard write) notes that thread as the session's route, as a
+   * stdio client's own write does: a session whose MCP config predates the stdio client names no session in its calls,
+   * so it gets no routes otherwise. A thread it can't read, or any other value, is ignored, and PostToolUse tells nothing.
+   * Without one: the agent's counts, exactly as before sessions.
+   */
+  hookUnread(event: string | null, thread: string | null = null): { unread: number; steer: number; targeted?: number } {
+    if (!this.session) return this.core.unread(this.actor);
+    if (event === 'PostToolUse' && thread && ROUTE_THREAD.test(thread)) {
+      const t = this.core.thread(thread);
+      if (t && this.canRead(t)) this.core.noteRoute(t.id, this.agent.id, this.session.id);
+    }
+    const counts = this.counts();
+    const targeted = this.core.targeted(this.session.id);
+    if ((event === 'UserPromptSubmit' && counts.unread > 0) || (event === 'Stop' && (targeted > 0 || counts.steer > 0))) this.core.tell(this.session.id);
+    return { ...counts, targeted };
+  }
+
+  /**
+   * GET /wait: holds until a session this client can wake (Core.reachable) has a wake due, or the timeout. A wake is due
+   * for a session that isn't busy and has unread mail for it that it wasn't told about; returning it tells the session
+   * (Core.tell), so a message wakes it once. It never reads mail, and untargeted mail never wakes anyone.
+   */
+  async wakes(timeoutMs: number, signal?: AbortSignal): Promise<{ wake: Array<{ session: string; unread: number; steer: number }> }> {
+    const end = Date.now() + timeoutMs;
+    for (;;) {
+      this.requireLiveToken();
+      const wake = this.core.reachable(this.agent.id, this.session?.id ?? null, this.threads)
+        .filter((s) => this.core.claimWake(s))
+        .map((s) => ({ session: s.key, ...this.core.unread(this.actor, s.id) }));
+      if (wake.length || Date.now() >= end || signal?.aborted) return { wake };
+      await this.core.waitFor(this.actor, end - Date.now(), signal);
+    }
+  }
+
+  /**
+   * list_team: your own principal's current sessions in full, online first; other principals' agents (those list_agents
+   * shows) only as counts of online and idle sessions: their sessions are private to them.
+   */
+  listTeam() {
+    this.core.expireSessions();
+    const mine = this.agent.principal_id;
+    const current = this.core.sessions();
+    const online = (s: Session) => this.core.online(s);
+    return {
+      sessions: current.filter((s) => principalOf(agentActor(s.agent_id)) === mine)
+        .sort((a, b) => Number(online(b)) - Number(online(a)) || b.active_at.localeCompare(a.active_at))
+        .map((s) => ({ address: `${s.agent_id}@${s.name}`, agent: s.agent_id, status: this.core.statusOf(s), repo: s.repo && s.branch ? `${s.repo}@${s.branch}` : s.repo, title: s.title, last_seen: s.seen_at })),
+      agents: this.listAgents().filter((a) => a.principal !== mine).map((a) => {
+        const on = current.filter((s) => s.agent_id === a.id && online(s));
+        return { agent: a.id, sessions: on.length, idle: on.filter((s) => !this.core.busy(s)).length };
+      }),
+    };
   }
 
   readThread(threadId: string, afterSeq = 0, limit = 100) {

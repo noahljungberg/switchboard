@@ -3,8 +3,7 @@
 // error triggers an announced failover; human-to-human chatter doesn't wake it.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, test } from 'node:test';
 import { parseConfig } from '../src/config.ts';
@@ -15,13 +14,13 @@ import { OpsAgent } from '../src/ops.ts';
 import { OpsMcp } from '../src/ops-mcp.ts';
 import { StubStatus } from '../src/status.ts';
 import { Windows } from '../src/windows.ts';
-import { Clock, FakeEngine, FakeSlack, RESOURCES, SLACK, buttonValue, call, turnThread, world } from './fakes.ts';
+import { Clock, FakeEngine, FakeSlack, RESOURCES, SLACK, buttonValue, call, hint, tempDir, turnThread, world } from './fakes.ts';
 
 const running: Array<{ stop(): Promise<void> }> = [];
 afterEach(async () => { while (running.length) await running.pop()!.stop(); }); // even when an assertion failed
 
 async function boot(primary = new FakeEngine('claude'), failover: FakeEngine | undefined = new FakeEngine('codex'), first?: FakeEngine, ops: Record<string, unknown> = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'sb-ops-'));
+  const dir = tempDir('sb-ops-');
   const config = parseConfig({
     listen: { host: '127.0.0.1', port: 0 }, data_dir: join(dir, 'data'), slack: { ops_channel: SLACK.ops },
     resources: RESOURCES, ops: { mcp_port: 0, ...ops },
@@ -85,6 +84,47 @@ describe('wake rules', () => {
     await settle();
     assert.equal(primary.turns.length, 1, 'an untagged reply doesn\'t wake it');
     assert.deepEqual(scout.readInbox().map((i) => [i.from, i.body['text']]), [['human', 'scout, yes it is']]);
+  });
+
+  test('tell_human\'s post and the human\'s reply under it reach the session that wrote to the human, though another is more recently active', async () => {
+    const primary = new FakeEngine('claude', async (req, mcp) => {
+      const items = [...req.prompt.matchAll(/"item":"(m_[0-9a-f]{12})"/g)].map((m) => m[1]!);
+      if (items.length) await call(mcp, 'tell_human', { principal: 'bob', text: 'Alice\'s scout asks whether the staging box is free after 15:00 UTC.', items });
+    });
+    const { sb, settle, say, slack, clock } = await boot(primary);
+    const as = (n: number, poll = true) => sb.core.forAgent(sb.core.agent('alice/scout')!, hint(n, { repo: `repo-${n}` }, { poll }));
+    const s1 = as(1);
+    s1.sendMessage('bob', 'staging box?');
+    clock.advance(1);
+    const s2 = as(2);
+    as(2, false); // a request: s2 is online and the most recently active
+    await settle();
+    const root = slack.posts.find((p) => p.channel === SLACK.ops && !p.threadTs)!;
+    await say(SLACK.bob, 'scout, yes it is', { threadTs: root.ts });
+    await settle();
+    assert.deepEqual(s1.readInbox().map((i) => [i.from, i.body['text']]),
+      [['ops', '@bob Alice\'s scout asks whether the staging box is free after 15:00 UTC.'], ['human', 'scout, yes it is']]);
+    assert.deepEqual(s2.readInbox(), []);
+  });
+
+  test('a tell_human batch holding items from two sessions of one agent routes to neither: its post and the human\'s reply there are for any of them', async () => {
+    const primary = new FakeEngine('claude', async (req, mcp) => {
+      const items = [...req.prompt.matchAll(/"item":"(m_[0-9a-f]{12})"/g)].map((m) => m[1]!);
+      if (items.length === 2) await call(mcp, 'tell_human', { principal: 'bob', text: 'Alice\'s scout asks about the staging box and the gateway.', items });
+    });
+    const { sb, settle, say, slack } = await boot(primary);
+    const as = (n: number) => sb.core.forAgent(sb.core.agent('alice/scout')!, hint(n, { repo: `repo-${n}` }, { poll: true }));
+    const [s1, s2] = [as(1), as(2)];
+    s1.sendMessage('bob', 'staging box?');
+    s2.sendMessage('bob', 'gateway?');
+    await settle();
+    const root = slack.posts.find((p) => p.channel === SLACK.ops && !p.threadTs)!;
+    await say(SLACK.bob, 'yes to both', { threadTs: root.ts });
+    await settle();
+    const thread = sb.core.threadBySlack(SLACK.ops, root.ts)!.id;
+    assert.deepEqual(sb.core.db.prepare("SELECT session FROM inbox WHERE thread_id = ? AND recipient = 'agent:alice/scout' ORDER BY id").all(thread).map((r) => r['session']), [null, null], 'untargeted');
+    assert.deepEqual([s1.counts().unread, s2.counts().unread], [2, 2], 'either session reads them');
+    assert.deepEqual(s2.readInbox().map((i) => i.body['text']), ['@bob Alice\'s scout asks about the staging box and the gateway.', 'yes to both']);
   });
 
   test('send_message(to: ops) and a new urgent window wake it, and it sees the window; the decision, the clock and the report don\'t (P5)', async () => {
@@ -458,7 +498,7 @@ describe('failover', () => {
     const engine = new FakeEngine('claude');
     engine.fail = () => new EngineError('prompt is too long');
     const windows = new Windows(w.core, RESOURCES);
-    const memory = new Memory(join(mkdtempSync(join(tmpdir(), 'sb-ops-')), 'memory'));
+    const memory = new Memory(join(tempDir('sb-ops-'), 'memory'));
     const agent = new OpsAgent({ core: w.core, windows, mcp: new OpsMcp({ core: w.core, windows, status: new StubStatus(), memory }), mcpUrl: 'http://127.0.0.1:9/mcp',
       engines: [engine], systemPrompt: () => 'sys', contextDir: memory.dir });
     const { thread } = w.s.scout.sendMessage('ops', 'status?');
@@ -560,7 +600,8 @@ describe('sessions', () => {
     const { thread } = scout.sendMessage('ops', 'kick-off: we coordinate the staging box here');
     await settle();
     scout.sendMessage('bob/helper', 'join', thread);
-    for (let i = 0; i < 600; i++) (i % 2 ? helper : scout).post(thread, `chatter ${i}`); // agent-to-agent: no wake
+    // Agent-to-agent chatter, which doesn't wake it, written as the core writes it: the loop guard would refuse 600 agent posts in ten minutes.
+    for (let i = 0; i < 600; i++) sb.core.postMessage(sb.core.thread(thread)!, (i % 2 ? helper : scout).actor, { text: `chatter ${i}` });
     const seen = sb.core.thread(thread)!.ops_seen_seq;
     scout.sendMessage('ops', 'WAKE-MARKER who has the box now?', thread);
     await settle();
@@ -572,10 +613,10 @@ describe('sessions', () => {
   });
 
   test('a lost engine session starts over with the thread\'s history, not just what is new', async () => {
-    const home = mkdtempSync(join(tmpdir(), 'sb-ops-home-'));
-    const dir = mkdtempSync(join(tmpdir(), 'sb-ops-'));
+    const home = tempDir('sb-ops-home-');
+    const dir = tempDir('sb-ops-');
     const config = parseConfig({ listen: { host: '127.0.0.1', port: 0 }, data_dir: join(dir, 'data'), slack: { ops_channel: SLACK.ops }, resources: RESOURCES, ops: { mcp_port: 0 } }, join(dir, 'config.yaml'));
-    const claude = new ClaudeEngine({ bin: new URL('./stubs/fake-claude.mjs', import.meta.url).pathname, runDir: mkdtempSync(join(tmpdir(), 'sb-run-')), home });
+    const claude = new ClaudeEngine({ bin: new URL('./stubs/fake-claude.mjs', import.meta.url).pathname, runDir: tempDir('sb-run-'), home });
     const sb = await start({ config, secrets: {}, slack: { port: new FakeSlack(), botUserId: SLACK.bot }, engines: [claude], now: new Clock().now });
     running.push(sb);
     sb.core.addPrincipal('alice', 'Alice', SLACK.alice);

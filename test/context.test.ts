@@ -2,13 +2,13 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { ContextRepos, Memory, MemoryError } from '../src/context.ts';
+import { tempDir } from './fakes.ts';
 
-const tmp = () => mkdtempSync(join(tmpdir(), 'sb-ctx-'));
+const tmp = () => tempDir('sb-ctx-');
 const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 function upstream(): { bare: string; work: string; commit: (file: string, text: string) => void } {

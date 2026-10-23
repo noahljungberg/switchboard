@@ -56,6 +56,6 @@ No web UI (plan §14), no config hot-reload (restart the unit).
 
 ## Status
 
-Complete for M1–M3. M2: resources in config; a 30 s tick runs `windows.tick()`, `core.pingIdleAgents()` and (P3) `core.expireAsks()`.
+Complete for M1–M3. M2: resources in config; a 30 s tick runs `windows.tick()`, `core.pingIdleAgents()`, (P3) `core.expireAsks()` and `core.expireSessions()` (gone sessions' names and mail).
 M3: the optional `ops:` section starts the context loop, the memory repo, the loopback ops MCP server and
 the ops agent (`startOps`); `serve` pets the systemd watchdog; `admin memory-revert <sha>`.

@@ -121,6 +121,8 @@ export interface Change {
   evidence: string | null;
   reported_at: string | null;
   created_at: string;
+  /** The session that queued it, which a lost slot steers (reply routing). */
+  session: number | null;
 }
 const OUTCOME_WORDS: Record<ChangeState, string> = { queued: 'not reported', done: 'done', rolled_back: 'rolled back', failed: 'failed', partial: 'partial', not_reported: 'not reported', withdrawn: 'withdrawn' };
 // P2: switchboard caps a system notice at 300 characters (slack.ts CARD_MAX); this leaves room for the tags to become
@@ -339,7 +341,7 @@ export class Windows {
       this.core.append(thread.id, 'system', 'slot_lost', {
         change: c.id, resource: c.resource_id,
         text: `The maintenance slot no longer covers ${c.resource_id} for your change ${c.id}: stop, leave prod in a known state, and report_window(id: "${c.id}") with what you did.`,
-      }, [{ recipient: agentActor(c.agent_id), priority: 'steer' }]);
+      }, [{ recipient: agentActor(c.agent_id), priority: 'steer', prefer: c.session ?? undefined }]);
     }
   }
 
@@ -434,17 +436,18 @@ export class Windows {
   /**
    * request_window without urgent (P5): queues a change for nextSlot() (the one running now, unless that day's
    * slot already ran). No window, no Slack post, no ops wake. The only thing it may post is a standing-approval
-   * card, to an approver the change needs whose cards for this schedule version don't list it yet.
+   * card, to an approver the change needs whose cards for this schedule version don't list it yet. `session`: the agent's
+   * session that queued it, which a lost slot steers.
    */
-  queue(agent: Agent, input: { resource: string; start?: string | undefined; duration_minutes?: number | undefined; plan: string; rollback: string; verify: string }) {
+  queue(agent: Agent, input: { resource: string; start?: string | undefined; duration_minutes?: number | undefined; plan: string; rollback: string; verify: string }, session: number | null = null) {
     const resource = this.resource(input.resource);
     this.requireOwner(agent, resource);
     for (const k of ['plan', 'rollback', 'verify'] as const) checkBody(input[k], k);
     return tx(this.core.db, () => {
       const slot = this.nextSlot();
       const id = newId('c');
-      run(this.core.db, 'INSERT INTO changes (id, agent_id, resource_id, plan, rollback, verify, slot_day, slot_start, slot_end, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        id, agent.id, resource.id, input.plan, input.rollback, input.verify, slot.day, slot.start, slot.end, this.core.iso());
+      run(this.core.db, 'INSERT INTO changes (id, agent_id, resource_id, plan, rollback, verify, slot_day, slot_start, slot_end, created_at, session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        id, agent.id, resource.id, input.plan, input.rollback, input.verify, slot.day, slot.start, slot.end, this.core.iso(), session);
       const cov = this.coverage(resource, agent.principal_id);
       const when = `${slot.active ? 'the maintenance slot running now' : 'the next maintenance slot'}, ${fmt(slot.start)} to ${fmt(slot.end, true)}`;
       const says: Record<CardState, (a: string) => string> = {
@@ -471,9 +474,10 @@ export class Windows {
 
   /**
    * request_window with urgent (P5): a window of its own, approved by its own Slack button. For what can't wait for the
-   * slot. Its card shows `title` (default: the plan's first sentence), never the plan, rollback or verify (P2).
+   * slot. Its card shows `title` (default: the plan's first sentence), never the plan, rollback or verify (P2). `session`: the
+   * agent's session that asked, which the window's decision, clock and reports reach (its thread's route).
    */
-  request(agent: Agent, input: { resource: string; start?: string | undefined; duration_minutes?: number | undefined; plan: string; rollback: string; verify: string; title?: string | undefined }) {
+  request(agent: Agent, input: { resource: string; start?: string | undefined; duration_minutes?: number | undefined; plan: string; rollback: string; verify: string; title?: string | undefined }, session: number | null = null) {
     const resource = this.resource(input.resource);
     this.requireOwner(agent, resource);
     for (const k of ['plan', 'rollback', 'verify'] as const) checkBody(input[k], k);
@@ -521,6 +525,7 @@ export class Windows {
         window: thread.id, resource: resource.id, resource_name: resource.name, note: resource.note ?? null, title,
         start: startAt, end: endAt, minutes, plan: input.plan, rollback: input.rollback, verify: input.verify, approvers, require: resource.require,
       });
+      if (session !== null) this.core.noteRoute(thread.id, agent.id, session);
       const pending = this.overlapping(resource.id, startAt, endAt, ['proposed'], thread.id).map((w) => w.id);
       // The card shows only the title, so say which, and ask for one when the plan's first sentence says little.
       const poor = title === 'maintenance' || title.endsWith('…') || Array.from(title).length < 12;

@@ -437,6 +437,52 @@ export const MIGRATIONS: string[] = [
       AND json_extract(e.body, '$.who') IN (SELECT id FROM principals) AND substr(e.actor, 7) IN (SELECT id FROM agents)
       AND NOT EXISTS (SELECT 1 FROM events a WHERE a.thread_id = e.thread_id AND a.type = 'human_answer' AND json_extract(a.body, '$.ask_seq') = e.seq);
   `,
+  // 15: sessions. An agent's token can have many live sessions, keyed per agent by its client ('claude:<session id>',
+  // 'codex:<thread id>'), each named uniquely among the agent's current ones (NULL once gone) and holding what its client
+  // last said about it: hints, never authority. An inbox row may target one session (NULL: any session of the agent reads
+  // it, as before). inbox_told: which sessions were told about which rows (a wake or a hook notice), so a message wakes
+  // each session at most once, even when it moves between them. routes: the session that last wrote in a thread for its
+  // agent, where replies go (NULL: none, so any of its sessions reads them); changes, asks and items for humans keep the
+  // session that queued, asked or wrote them.
+  // Existing rows: no sessions, every inbox row untargeted.
+  `
+  CREATE TABLE sessions (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id  TEXT NOT NULL REFERENCES agents(id),
+    key       TEXT NOT NULL,
+    name      TEXT,
+    host      TEXT,
+    cwd       TEXT,
+    repo      TEXT,
+    branch    TEXT,
+    title     TEXT,
+    status    TEXT CHECK (status IN ('busy', 'idle', 'waiting')),
+    by_client INTEGER NOT NULL DEFAULT 0,             -- status comes from the client (Claude's registry), which hooks don't override
+    hooks     INTEGER NOT NULL DEFAULT 0,
+    polled_at TEXT,                                   -- a client polled /wait for it: it can be woken
+    waited_at TEXT,                                   -- it held wait_for_message
+    active_at TEXT NOT NULL,
+    seen_at   TEXT NOT NULL,
+    UNIQUE (agent_id, key)
+  );
+  CREATE UNIQUE INDEX sessions_name ON sessions (agent_id, name);
+  ALTER TABLE inbox ADD COLUMN session INTEGER REFERENCES sessions(id);
+  CREATE INDEX inbox_session ON inbox (session, read_at);
+  CREATE TABLE inbox_told (
+    inbox_id INTEGER NOT NULL REFERENCES inbox(id),
+    session  INTEGER NOT NULL REFERENCES sessions(id),
+    PRIMARY KEY (inbox_id, session)
+  );
+  CREATE TABLE routes (
+    thread_id TEXT NOT NULL REFERENCES threads(id),
+    agent_id  TEXT NOT NULL REFERENCES agents(id),
+    session   INTEGER REFERENCES sessions(id),
+    PRIMARY KEY (thread_id, agent_id)
+  );
+  ALTER TABLE changes ADD COLUMN session INTEGER REFERENCES sessions(id);
+  ALTER TABLE asks ADD COLUMN session INTEGER REFERENCES sessions(id);
+  ALTER TABLE human_items ADD COLUMN session INTEGER REFERENCES sessions(id);
+  `,
 ];
 
 export function openDb(path: string): Db {

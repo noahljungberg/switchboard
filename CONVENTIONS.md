@@ -20,7 +20,7 @@ Copy the patterns already in `src/`. When in doubt, the shorter code that a revi
 ## Errors
 
 - Refusals at the trust boundary throw `SwitchboardError(code, message)` with code `not_found`,
-  `forbidden`, `invalid`, `conflict` or `muted`. The message goes verbatim to an agent or a human, so it
+  `forbidden`, `invalid`, `conflict`, `muted` or `loop_guard`. The message goes verbatim to an agent or a human, so it
   says what to do next ("use request_window instead"), not just what failed.
 - Don't confirm another principal's private thread exists: "not found" and "not yours" read the same.
 - Everything else is a bug: log it with `console.error` and return a generic error to the caller.

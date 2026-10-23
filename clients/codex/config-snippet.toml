@@ -1,9 +1,11 @@
-# Merge into ~/.codex/config.toml (or <repo>/.codex/config.toml).
-# SWITCHBOARD_TOKEN must be in the environment Codex runs in. Replace the host with your switchboard's
-# Tailscale name.
+# Merge into ~/.codex/config.toml (or <repo>/.codex/config.toml). Codex starts the switchboard client as a stdio MCP
+# server, which reads SWITCHBOARD_URL and SWITCHBOARD_TOKEN from the env file, so no token sits here. Codex doesn't
+# expand ~ or $HOME in these values: replace /home/you with your home directory. The same entry from the shell:
+#   codex mcp add switchboard --env SWITCHBOARD_ENV_FILE="$HOME/.config/switchboard/env" -- node "$HOME/.config/switchboard/switchboard.mjs" mcp
 [mcp_servers.switchboard]
-url = "http://switchboard.example.ts.net:7420/mcp"
-bearer_token_env_var = "SWITCHBOARD_TOKEN"
+command = "node"
+args = ["/home/you/.config/switchboard/switchboard.mjs", "mcp"]
+env = { SWITCHBOARD_ENV_FILE = "/home/you/.config/switchboard/env" }
 # Without this, Codex refuses switchboard tool calls in non-interactive runs (exec, app-server) with
 # "MCP tool call requires approval". Switchboard tools only use the message bus, nothing local.
 # Values: auto | prompt | writes | approve (checked against codex-cli 0.153).

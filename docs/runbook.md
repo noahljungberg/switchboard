@@ -263,3 +263,41 @@ that schedule once.
   edit stays as it was. Declined, done and expired windows are left alone. It rewrites only each card's root message,
   not copies the ops agent re-posted under it (`request_approval`); those keep their old text, and their buttons still
   work. Each run is one `audit` row (`rerender_cards`).
+
+## 13. Agents' clients and sessions
+
+Each agent's machine runs the switchboard client, [`clients/switchboard.mjs`](../clients/switchboard.mjs) (one file,
+Node ≥ 24, no dependencies), as its MCP server and hook. Setup per kit: [clients/claude-code/](../clients/claude-code/),
+[clients/codex/](../clients/codex/).
+
+- **Setup.** On the agent's machine: `SWITCHBOARD_URL=… SWITCHBOARD_TOKEN=… node switchboard.mjs install` (from
+  `clients/` in a checkout). It is idempotent: it writes the env file and the client to `~/.config/switchboard/`, merges
+  the hooks into `~/.claude/settings.json` and `~/.codex/hooks.json`, sets both MCP entries to the stdio client (in
+  `~/.codex/config.toml` that drops an old `url` and token), and first backs up each file it changes to
+  `~/.config/switchboard/backup-<UTC time>/`. It exits 1 without credentials, or when a file can't be edited safely
+  (that one is left as is). The kits' READMEs have the manual steps.
+- **Credentials.** The client reads `SWITCHBOARD_URL` and `SWITCHBOARD_TOKEN` from the environment, or from the file
+  `SWITCHBOARD_ENV_FILE` names (the kits use `~/.config/switchboard/env`, mode 0600), so no token sits in an MCP
+  config. After `sb issue-token`, run install with the new token (or update that file) and restart the session: the MCP
+  server reads it once, at start.
+- **Sessions.** Each Claude Code session and Codex thread on a token is a session, `<agent>@<repo>` (`-2`, `-3` on a
+  collision). Mail to an agent targets the session that last wrote in the thread, else its most recently active online
+  idle one. A session keeps its name 24 h after it was last seen (15 minutes if no client could ever wake it). Once its
+  client has stopped polling for 10 minutes (the session closed), or it is gone, its unread mail moves on at the next
+  30 s tick, to an online session or to any. In a session, `list_team` shows them; from the host:
+  `sqlite3 /var/lib/switchboard/switchboard.db "select agent_id, name, key, status, host, polled_at, seen_at from sessions where name is not null order by seen_at desc"`
+- **Wakes.** A Claude Code session is woken by its `rewake` Stop hook (`"asyncRewake": true`): it holds `GET /wait`
+  while the session is idle and exits 2 with the notice when mail arrives for it, which starts a turn. It re-arms at
+  every turn's end; a session idle for more than its 24 h timeout with no mail waits until its next turn. A Codex
+  thread is woken by its stdio client, or by the waiter its hook starts (`switchboard.mjs wake codex …`, one per
+  thread, ending with its Codex), with `codex queue`. Never through Claude Code's messaging socket (K31). Locks and logs
+  are in `$XDG_RUNTIME_DIR/switchboard/` (`claude-<pid>.log`, `codex-<thread>.log`). If a session isn't woken, check
+  that it is online (`polled_at` within 2 minutes), the rewaker's or waiter's log, the client's stderr (`switchboard:
+  wake poll failed …`), and for Codex that `codex` is on the client's `PATH`.
+- **Loop guard.** An agent's message that takes it past 12 deliveries to one recipient (each relay request counts), or
+  past 60 messages in all, within 10 minutes is refused with `loop_guard` and audited; nothing goes to Slack. To see them:
+  `sqlite3 /var/lib/switchboard/switchboard.db "select at, actor, detail from audit where action = 'loop_guard' order by id desc limit 20"`
+- **Old setups** keep working: a caller with only an HTTP MCP entry and its bearer token, or the old hook, reads all
+  of its agent's mail as before. With the kit's hooks (Claude Code: the `rewake` Stop entry; Codex: `switchboard.mjs
+  hook codex`), an HTTP-only session is woken too, and Claude Code's `PostToolUse` entry routes replies in the threads
+  it writes in back to it.

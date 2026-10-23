@@ -201,6 +201,13 @@ export class OpsMcp {
             kind: 'chat', visibility: 'shared', title: `Ops agent → ${p.name}`,
             participants: ['ops', principalActor(p.id), ...new Set(items.map((i) => agentActor(i.from_agent)))],
           });
+          // This post, and the human's replies under it, go to the session that wrote an agent's items (reply routing). Items
+          // from several of its sessions route to none, so any of its sessions reads them there, as before sessions.
+          for (const agent of scope.dm ? [] : new Set(items.map((i) => i.from_agent))) {
+            const sessions = new Set(items.filter((i) => i.from_agent === agent).map((i) => i.session));
+            if (sessions.size > 1) core.noteRoute(t.id, agent, null);
+            else for (const s of sessions) if (s !== null) core.noteRoute(t.id, agent, s);
+          }
           const { event } = core.postMessage(t, 'ops', { text, told: items.map((i) => i.id) });
           core.handleHumanItems(items.map((i) => i.id), 'told', `${t.id}#${event.seq}`);
           grant.responded.push(scope.threadId);
