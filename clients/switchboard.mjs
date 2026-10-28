@@ -22,7 +22,7 @@ import { accessSync, appendFileSync, chmodSync, constants, existsSync, mkdirSync
 import http from 'node:http';
 import https from 'node:https';
 import { homedir, hostname, tmpdir } from 'node:os';
-import { basename, delimiter, dirname, join, relative, resolve } from 'node:path';
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
@@ -204,9 +204,31 @@ async function wakeLoop(kind, url, token, pid, onWake) {
   }
 }
 
-/** The executable of process `pid`: /proc/<pid>/exe on Linux, else what ps says. */
+/**
+ * Windows' process table, read once per process: pid -> its parent and executable. Windows has neither /proc nor
+ * `ps -o` (Git Bash's ps takes no -o), and a hook's node sits a few bash.exe processes below Claude Code's.
+ */
+let winProcs = null;
+function winProc(pid) {
+  if (!winProcs) {
+    winProcs = new Map();
+    try {
+      const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+        'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.ExecutablePath)" }'],
+      { encoding: 'utf8', timeout: 15_000, windowsHide: true });
+      for (const line of out.split(/\r?\n/)) {
+        const [p, ppid, exe = ''] = line.split('\t');
+        if (p) winProcs.set(Number(p), { ppid: Number(ppid), exe });
+      }
+    } catch { /* no table: every lookup finds nothing */ }
+  }
+  return winProcs.get(pid);
+}
+
+/** The executable of process `pid`: /proc/<pid>/exe on Linux, the process table on Windows, else what ps says. */
 function exeOf(pid) {
   try { return readlinkSync(`/proc/${pid}/exe`); } catch { /* not Linux */ }
+  if (process.platform === 'win32') return winProc(pid)?.exe ?? '';
   try { return execFileSync('ps', ['-o', 'comm=', '-p', String(pid)], { encoding: 'utf8', timeout: 2_000 }).trim(); } catch { return ''; }
 }
 
@@ -218,7 +240,7 @@ function exeOf(pid) {
 function codexBin(pid) {
   if (process.env.SWITCHBOARD_CODEX_BIN) return process.env.SWITCHBOARD_CODEX_BIN;
   const exe = exeOf(pid);
-  return exe.startsWith('/') && basename(exe).startsWith('codex') ? exe : 'codex';
+  return isAbsolute(exe) && basename(exe).startsWith('codex') ? exe : 'codex';
 }
 
 /** The wake notice, built from the two counts alone: no other value from switchboard reaches the session. */
@@ -275,14 +297,18 @@ function holdLock(name) {
   return () => { try { if (readFileSync(lock, 'utf8') === String(process.pid)) unlinkSync(lock); } catch { /* gone already */ } };
 }
 
-/** The parent of process `pid`: /proc/<pid>/stat on Linux, else ps. */
+/** The parent of process `pid`: /proc/<pid>/stat on Linux, the process table on Windows, else ps. */
 function parentOf(pid) {
   try { return Number(readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').pop().split(' ')[1]); } catch { /* not Linux */ }
+  if (process.platform === 'win32') return winProc(pid)?.ppid ?? 0;
   try { return Number(execFileSync('ps', ['-o', 'ppid=', '-p', String(pid)], { encoding: 'utf8', timeout: 2_000 }).trim()); } catch { return 0; }
 }
-/** The nearest of this hook's ancestors, up to 4 levels (a shell may sit between), for which `test` holds; else 0. */
+/**
+ * The nearest of this hook's ancestors, up to 6 levels, for which `test` holds; else 0. Shells may sit between: on
+ * Windows, Claude Code runs a hook through Git Bash, three bash.exe processes deep.
+ */
 function ancestor(test) {
-  for (let pid = process.ppid, level = 0; pid > 1 && level < 4; pid = parentOf(pid), level++) if (test(pid)) return pid;
+  for (let pid = process.ppid, level = 0; pid > 1 && level < 6; pid = parentOf(pid), level++) if (test(pid)) return pid;
   return 0;
 }
 /** A Codex process: its executable, or its name (a script's), starts with `codex`. */
@@ -595,7 +621,7 @@ function install() {
 
   // The `node` on this PATH, by that path (a stable link such as /opt/homebrew/bin/node, not the versioned binary it
   // points to), else this process's own: an app started from a GUI may not have node on its PATH, and its hooks would fail.
-  const node = (process.env.PATH ?? '').split(delimiter).filter(Boolean).map((d) => join(d, 'node'))
+  const node = (process.env.PATH ?? '').split(delimiter).filter(Boolean).map((d) => join(d, process.platform === 'win32' ? 'node.exe' : 'node'))
     .find((p) => { try { accessSync(p, constants.X_OK); return statSync(p).isFile(); } catch { return false; } }) ?? process.execPath;
   const run = (args) => `SWITCHBOARD_ENV_FILE=${shellWord(envPath)} ${shellWord(node)} ${shellWord(client)} ${args}`;
   const stdio = { type: 'stdio', command: node, args: [client, 'mcp'], env: { SWITCHBOARD_ENV_FILE: envPath } };
