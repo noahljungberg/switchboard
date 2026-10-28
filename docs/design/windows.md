@@ -126,16 +126,18 @@ Advisory (P1): agents check `window_status`; enforcement belongs in the systems 
 | Only owners' agents request; duration ≤ policy max; start not in the past, ≤ 30 days out, with Z or an explicit UTC offset (or `now`) | `request` | `CHECK (end_at > start_at)` |
 | No overlap with approved/active windows on the resource, at request and again at approval | `request`, `decideFromSlackButton` | |
 | No approval once a proposed window's end has passed (a stale button pressed before the tick expires it) | `decideFromSlackButton` | |
-| Approvers: policy `approvers`, else owners other than the requester's principal, else the owners. Never empty, never an agent | `policy` | `CHECK (json_array_length(approvers) > 0)` |
+| Approvers: policy `approvers`, else owners other than the requester's principal, else the owners. Never empty, never an agent. They are who the card asks | `policy` | `CHECK (json_array_length(approvers) > 0)` |
+| Who decides: a `require: any` window, its approvers or any owner of its resource (the requester's own principal too), and the latest decision wins until it starts: an approval can be declined and a decline approved again, before its end. A `require: all` window, only its approvers, and one decline stands | `decideFromSlackButton` | migration 16: `approvals_from_approver`, `windows_state_machine` (`declined` → `approved` only for require any) |
+| A flip needs a newer row: a declined window is approved again only through a newer approve, an approved one declined only through a newer decline | `decideFromSlackButton` | migration 16: `windows_reapproval_needs_newer_approve`, `windows_decline_needs_newer_decline` |
 | Terms, title and approvers are fixed once requested: the title is what the approver sees (P2) | `request` | `windows_terms_fixed` (migration 10 adds `title`) |
 | `approved` needs approvals rows (one for `any`, every approver for `all`) | `decideFromSlackButton` | `windows_approved_needs_approvals` |
-| An approval row comes from an approver, recorded with that principal's own Slack user id | `decideFromSlackButton` | `approvals_from_approver` |
+| An approval row comes from an approver (or, require any, an owner of the resource), recorded with that principal's own Slack user id | `decideFromSlackButton` | `approvals_from_approver` (migration 16) |
 | `declined` needs a decline row; approvals are append-only | | `windows_declined_needs_decline`, `approvals_no_update/delete` |
 | Only legal transitions | `setState` callers | `windows_state_machine` |
 | `may_proceed` only inside an active window the caller's principal asked for | `mayProceed` | |
 | Only the requester's principal reports, only when active (or approved and past start) | `report` | |
 | Window decisions and clock events steer the requesting agent (the core may steer) | deliveries | |
-| In Slack a window is one card of one line: decisions, start, end, expiry and the report rewrite it in place; only the overdue page and a failed report are replies (P5, P2) | `slack.ts` `windowAsk`, `windowUpdate` | |
+| In Slack a window is one card of one line: decisions, start, end, expiry and the report rewrite it in place; only the overdue page and a failed report are replies (P5, P2). Until a `require: any` window starts, its decided card keeps the one button that overrules the decision (Decline after an approval, Approve after a decline); an active card has none | `slack.ts` `windowAsk`, `windowUpdate` | |
 | The plan, rollback, verify and report evidence never reach Slack (P2) | `slack.ts` (never rendered) | |
 
 Nightly slot (migrations 8 and 9):

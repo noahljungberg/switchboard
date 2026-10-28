@@ -284,16 +284,19 @@ describe('approval: only the Slack button handler, only an allowed Slack user', 
     assert.throws(() => core.db.prepare("UPDATE windows SET state = 'approved' WHERE id = ?").run(win.window), /only through approvals/);
     assert.throws(() => core.db.prepare("UPDATE windows SET state = 'active' WHERE id = ?").run(win.window), /illegal window state transition/);
     assert.throws(() => core.db.prepare("INSERT INTO approvals (window_id, approver, slack_user_id, decision, decided_at) VALUES (?, 'bob', 'UFORGED01', 'approve', 'x')").run(win.window), /own Slack user/);
-    assert.throws(() => core.db.prepare("INSERT INTO approvals (window_id, approver, slack_user_id, decision, decided_at) VALUES (?, 'alice', ?, 'approve', 'x')").run(win.window, SLACK.alice), /window's approvers/);
+    const box = windows.request(s.agents.scout, { resource: 'alice-box', start: '2026-10-14T16:00:00Z', duration_minutes: 30, plan: 'p', rollback: 'r', verify: 'v' });
+    assert.throws(() => core.db.prepare("INSERT INTO approvals (window_id, approver, slack_user_id, decision, decided_at) VALUES (?, 'bob', ?, 'approve', 'x')").run(box.window, SLACK.bob), /window's approvers/,
+      'bob neither is an approver of nor owns alice-box');
     assert.throws(() => core.db.prepare("UPDATE windows SET approvers = '[\"alice\"]' WHERE id = ?").run(win.window), /fixed once requested/);
     isProposed(); noApprovals();
 
-    // 4. Buttons pressed by the wrong people.
-    await press(win.window, SLACK.alice);
+    // 4. Buttons pressed by the wrong people: no principal, the bot, and a principal who doesn't own the resource.
     await press(win.window, SLACK.stranger);
     await press(win.window, SLACK.bot);
+    await press(box.window, SLACK.bob);
     isProposed(); noApprovals();
-    assert.match(slack.ephemerals.at(-3)!.text, /Alice can't decide windows on API gateway/);
+    assert.equal(windows.window(box.window)!.state, 'proposed');
+    assert.match(slack.ephemerals.at(-1)!.text, /Bob can't decide windows on Alice's staging box/);
 
     // 5. The allowed approver's button.
     await press(win.window, SLACK.bob);
@@ -316,15 +319,69 @@ describe('decisions', () => {
     assert.equal(windows.window(w.window)!.state, 'approved');
   });
 
-  test('decline is final; suggest only asks for another time', async () => {
+  test('suggest only asks for another time; a decline is final under require all', async () => {
     const { ask, press, windows, s } = setup();
     const w = ask();
     await press(w.window, SLACK.bob, 'suggest');
     assert.equal(windows.window(w.window)!.state, 'proposed');
+    assert.deepEqual(s.scout.readInbox().map((i) => i.body['decision']), ['suggest']);
+    const db = ask('main-db', 30, '2026-10-14T15:00:00Z');
+    await press(db.window, SLACK.alice, 'decline');
+    assert.equal(windows.window(db.window)!.state, 'declined');
+    for (const user of [SLACK.alice, SLACK.bob]) {
+      assert.equal(errCode(() => windows.decideFromSlackButton({ windowId: db.window, slackUserId: user, decision: 'approve' })), 'conflict', 'both must approve: one veto stands');
+    }
+  });
+
+  test('either owner decides a require-any window, its own side\'s too, and the latest decision wins until it starts', async () => {
+    const { ask, press, windows, slack, core, settle } = setup();
+    const w = ask(); // alice's agent asks; the listed approver is bob, but alice owns the API gateway too
+    await settle();
+    const own = () => slack.updates.filter((u) => u.ts === slack.posts[0]!.ts).at(-1)!; // the window's own card
+    await press(w.window, SLACK.alice);
+    await settle();
+    assert.equal(windows.window(w.window)!.state, 'approved', 'the requester\'s own principal may approve');
+    assert.match(own().text, /Approved by Alice/);
+    assert.ok(buttonValue(own(), 'sb_win_decline'), 'the card keeps a Decline, so the other owner can overrule');
     await press(w.window, SLACK.bob, 'decline');
-    assert.equal(windows.window(w.window)!.state, 'declined');
-    assert.equal(errCode(() => windows.decideFromSlackButton({ windowId: w.window, slackUserId: SLACK.bob, decision: 'approve' })), 'conflict');
-    assert.deepEqual(s.scout.readInbox().map((i) => i.body['decision']), ['suggest', 'decline']);
+    await settle();
+    assert.equal(windows.window(w.window)!.state, 'declined', 'the other owner overrules the approval');
+    assert.match(own().text, /Declined by Bob/);
+    assert.ok(buttonValue(own(), 'sb_win_approve'), 'the card keeps an Approve, so the decline can be overruled');
+    await press(w.window, SLACK.alice);
+    await settle();
+    assert.equal(windows.window(w.window)!.state, 'approved', 'and the decline is overruled in turn');
+    assert.match(own().text, /Approved by Alice/);
+    assert.equal(errCode(() => windows.decideFromSlackButton({ windowId: w.window, slackUserId: SLACK.bob, decision: 'approve' })), 'conflict', 'already approved');
+    const rows = core.db.prepare('SELECT approver, decision FROM approvals ORDER BY rowid').all().map((r) => ({ ...r }));
+    assert.deepEqual(rows, [{ approver: 'alice', decision: 'approve' }, { approver: 'bob', decision: 'decline' }, { approver: 'alice', decision: 'approve' }]);
+  });
+
+  test('no overruling once a window is active, or a declined one after its end', async () => {
+    const { ask, press, windows, clock, slack } = setup();
+    const w = ask(); // 14:00–14:30
+    await press(w.window, SLACK.bob);
+    clock.advance(120); // 14:00
+    windows.tick();
+    assert.equal(windows.window(w.window)!.state, 'active');
+    assert.equal(errCode(() => windows.decideFromSlackButton({ windowId: w.window, slackUserId: SLACK.alice, decision: 'decline' })), 'conflict');
+    assert.doesNotMatch(JSON.stringify(slack.updates.at(-1)!.blocks ?? []), /sb_win_/, 'an active window\'s card has no buttons');
+    const late = ask('api-gateway', 30, '2026-10-14T15:00:00Z'); // 15:00–15:30
+    await press(late.window, SLACK.bob, 'decline');
+    clock.advance(91); // 15:31
+    assert.equal(errCode(() => windows.decideFromSlackButton({ windowId: late.window, slackUserId: SLACK.alice, decision: 'approve' })), 'conflict');
+    assert.equal(windows.window(late.window)!.state, 'declined');
+  });
+
+  test('the database holds the line too: a re-approval needs a newer approve row, a decline a newer decline row', async () => {
+    const { ask, press, windows, core } = setup();
+    const w = ask();
+    await press(w.window, SLACK.bob);
+    await press(w.window, SLACK.alice, 'decline');
+    assert.throws(() => core.db.prepare("UPDATE windows SET state = 'approved' WHERE id = ?").run(w.window), /newer approval/, 'the old approve row doesn\'t count after a decline');
+    await press(w.window, SLACK.bob);
+    assert.throws(() => core.db.prepare("UPDATE windows SET state = 'declined' WHERE id = ?").run(w.window), /newer decline/, 'the old decline row doesn\'t count after an approval');
+    assert.equal(windows.window(w.window)!.state, 'approved');
   });
 
   test('a stale Approve pressed after a proposed window ended is refused, before the tick expires it', async () => {
@@ -350,6 +407,7 @@ describe('decisions', () => {
 
 describe('an urgent window in Slack is one card (P5)', () => {
   const actions = (blocks?: Array<Record<string, unknown>>) => (blocks ?? []).filter((b) => b['type'] === 'actions');
+  const ids = (blocks?: Array<Record<string, unknown>>) => actions(blocks).flatMap((b) => (b['elements'] as Array<{ action_id: string }>).map((e) => e.action_id));
 
   test('its decision, start, end and report rewrite the card in place; only the overdue page is a reply', async () => {
     const { ask, windows, clock, agents, slack, settle, bridge } = setup();
@@ -363,7 +421,7 @@ describe('an urgent window in Slack is one card (P5)', () => {
     assert.equal(slack.posts.length, 1, 'the decision is not a post of its own');
     assert.equal(last().ts, card.ts);
     assert.equal(last().text, ':white_check_mark: API gateway, 14:00–14:30 UTC: `bump gateway`. Approved by Bob.', 'one line (P2)');
-    assert.deepEqual(actions(last().blocks), [], 'the buttons are gone');
+    assert.deepEqual(ids(last().blocks), ['sb_win_decline'], 'only the button that overrules it, until it starts');
 
     clock.advance(110); // 13:50: no T-10 reminder
     assert.deepEqual(windows.tick(), []);
@@ -371,6 +429,7 @@ describe('an urgent window in Slack is one card (P5)', () => {
     windows.tick();
     await settle();
     assert.equal(last().text, ':construction: API gateway, 14:00–14:30 UTC: `bump gateway`. In progress until 14:30.');
+    assert.deepEqual(ids(last().blocks), [], 'an active window\'s card has no buttons: no overruling once it started');
     clock.advance(30); // 14:30
     windows.tick();
     await settle();
@@ -444,7 +503,7 @@ describe('an urgent window in Slack is one card (P5)', () => {
     assert.deepEqual(actions(slack.updates.at(-1)!.blocks), []);
   });
 
-  test('a stale Suggest press on an approved window changes nothing: its card keeps the approved line, without buttons (P2)', async () => {
+  test('a stale Suggest press on an approved window changes nothing: its card keeps the approved line and only its Decline (P2)', async () => {
     const { ask, slack, settle, bridge, windows, core } = setup();
     const w = ask();
     await settle();
@@ -467,18 +526,25 @@ describe('an urgent window in Slack is one card (P5)', () => {
     windows.rerenderCards();
     await settle();
     assert.equal(slack.updates.at(-1)!.text, ':white_check_mark: API gateway, 14:00–14:30 UTC: `bump gateway`. Approved by Bob.');
-    assert.deepEqual(actions(slack.updates.at(-1)!.blocks), []);
+    assert.deepEqual(ids(slack.updates.at(-1)!.blocks), ['sb_win_decline']);
   });
 
-  test('a declined card says who declined, in one line without buttons; a window on another day names its date (P2)', async () => {
+  test('a declined card says who declined, in one line with only an Approve to overrule it; a require-all card keeps none; a window on another day names its date (P2)', async () => {
     const { ask, slack, settle, press } = setup();
     const w = ask('api-gateway', 30, '2026-10-16T09:00:00Z');
     await settle();
     assert.match(slack.posts[0]!.text, /API gateway, Oct 16 09:00–09:30 UTC: `bump gateway`/);
     await press(w.window, SLACK.bob, 'decline');
     await settle();
-    assert.equal(slack.updates.at(-1)!.text, ':no_entry: API gateway, Oct 16 09:00–09:30 UTC: `bump gateway`. Declined by Bob.');
-    assert.deepEqual(actions(slack.updates.at(-1)!.blocks), []);
+    const card = (i: number) => slack.updates.filter((u) => u.ts === slack.posts[i]!.ts).at(-1)!;
+    assert.equal(card(0).text, ':no_entry: API gateway, Oct 16 09:00–09:30 UTC: `bump gateway`. Declined by Bob.');
+    assert.deepEqual(ids(card(0).blocks), ['sb_win_approve']);
+    const db = ask('main-db', 30, '2026-10-16T10:00:00Z');
+    await settle();
+    await press(db.window, SLACK.alice, 'decline');
+    await settle();
+    assert.match(card(1).text, /Declined by Alice/);
+    assert.deepEqual(ids(card(1).blocks), [], 'require all: one decline stands, so nothing to overrule');
   });
 });
 

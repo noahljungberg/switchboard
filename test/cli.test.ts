@@ -193,7 +193,7 @@ test('admin rerender-cards: the service rewrites every standing card and live ur
     return [u.text, ((u.blocks ?? []).find((b) => b['type'] === 'actions') as { elements: Array<{ action_id: string }> } | undefined)?.elements.map((e) => e.action_id) ?? []];
   };
   assert.deepEqual(buttons(cardTs.proposed), [`:wrench: <@${SLACK.bob}> API gateway, 15:00–15:30 UTC: \`Bump the gateway\` (scout, Alice's agent)`, ['sb_win_approve', 'sb_win_decline']]);
-  assert.deepEqual(buttons(cardTs.approved), [':white_check_mark: API gateway, 16:00–16:30 UTC: `Restart the gateway`. Approved by Bob.', []]);
+  assert.deepEqual(buttons(cardTs.approved), [':white_check_mark: API gateway, 16:00–16:30 UTC: `Restart the gateway`. Approved by Bob.', ['sb_win_decline']], 'until it starts, only the button that overrules it');
   assert.deepEqual(buttons(cardTs.active), [':construction: API gateway, 12:30–13:00 UTC: `Patch the gateway`. In progress until 13:00.', []]);
   assert.deepEqual(buttons(cardTs.legacy), [`:wrench: <@${SLACK.alice}> Core API and DB, 18:00–18:45 UTC: \`Raise API rate limits\` (scout, Alice's agent)`, ['sb_win_approve', 'sb_win_decline']]);
   assert.deepEqual(buttons(cardTs.bob2), [':calendar: Nightly maintenance 22:00–00:00 UTC. Approved by Bob.', ['sb_std_revoke']]);

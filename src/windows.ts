@@ -776,31 +776,41 @@ export class Windows {
         this.core.append(w.id, actor, 'window_decision', { window: w.id, decision: 'suggest', by: principal.id, state: w.state, requested_by: w.requested_by }, requester);
         return { state: w.state, text: `${principal.name} asked for another time. Reply in the thread with one; the requester re-requests.`, final: false };
       }
-      if (!w.approvers.includes(principal.id)) {
-        throw new SwitchboardError('forbidden', `${principal.name} can't decide windows on ${resource.name}. Approvers: ${w.approvers.join(', ')}.`);
+      // Either owner decides a require-any window, its own side's too, and the latest decision wins until it starts: an
+      // approval can be declined, and a decline approved again. A require-all window keeps its rule: only its
+      // approvers decide, and one decline stands (migration 16 enforces both).
+      const decides = w.approvers.includes(principal.id) || (!w.require_all && resource.owners.includes(principal.id));
+      if (!decides) {
+        const who = w.require_all ? w.approvers : [...new Set([...resource.owners, ...w.approvers])];
+        throw new SwitchboardError('forbidden', `${principal.name} can't decide windows on ${resource.name}. ${w.require_all ? 'Approvers' : 'Its owners decide'}: ${who.join(', ')}.`);
       }
       if (input.decision === 'decline') {
         if (w.state !== 'proposed' && w.state !== 'approved') throw new SwitchboardError('conflict', `window is already ${w.state}.`);
+        const overruled = w.state === 'approved';
         this.insertApproval(w.id, principal.id, input.slackUserId, 'decline');
         this.setState(w, 'declined');
         this.core.append(w.id, actor, 'window_decision', { window: w.id, decision: 'decline', by: principal.id, state: 'declined', requested_by: w.requested_by }, requester);
-        return { state: 'declined', text: `Declined by ${principal.name}.`, final: true };
+        return { state: 'declined', text: `Declined by ${principal.name}${overruled ? ', overruling the approval' : ''}.`, final: true };
       }
-      if (w.state !== 'proposed') throw new SwitchboardError('conflict', `window is already ${w.state}.`);
+      const overrule = w.state === 'declined' && !w.require_all;
+      if (w.state !== 'proposed' && !overrule) throw new SwitchboardError('conflict', `window is already ${w.state}.`);
       // A stale button can be pressed after the end but before the 30 s tick expires the window.
       if (this.core.iso() >= w.end_at) throw new SwitchboardError('conflict', `this window ended at ${fmt(w.end_at)} without approval. Ask the requester for a new one.`);
-      const already = one(this.core.db, "SELECT 1 FROM approvals WHERE window_id = ? AND approver = ? AND decision = 'approve'", w.id, principal.id);
+      // Require all counts one approval per approver; require any is decided by the first approval (or the latest, after a decline).
+      const already = w.require_all && one(this.core.db, "SELECT 1 FROM approvals WHERE window_id = ? AND approver = ? AND decision = 'approve'", w.id, principal.id);
       if (already) throw new SwitchboardError('conflict', `${principal.name} already approved this window.`);
       const clash = this.overlapping(w.resource_id, w.start_at, w.end_at, ['approved', 'active'], w.id);
       if (clash.length) throw new SwitchboardError('conflict', `it now overlaps ${clash.map((c) => c.id).join(', ')} (${clash[0]!.state}). Decline one of them first.`);
       this.insertApproval(w.id, principal.id, input.slackUserId, 'approve');
-      const approved = new Set(all<{ approver: string }>(this.core.db, "SELECT approver FROM approvals WHERE window_id = ? AND decision = 'approve'", w.id).map((r) => r.approver));
+      const approved = new Set(w.require_all
+        ? all<{ approver: string }>(this.core.db, "SELECT approver FROM approvals WHERE window_id = ? AND decision = 'approve'", w.id).map((r) => r.approver)
+        : [principal.id]); // require any: the approval that decides it now
       const done = w.require_all ? w.approvers.every((a) => approved.has(a)) : true;
       if (done) this.setState(w, 'approved');
       const state: WindowState = done ? 'approved' : 'proposed';
       this.core.append(w.id, actor, 'window_decision', { window: w.id, decision: 'approve', by: principal.id, state, approved: [...approved], requested_by: w.requested_by, start: w.start_at }, requester);
       return done
-        ? { state, text: `Approved by ${[...approved].map((p) => this.core.principal(p)?.name ?? p).join(' and ')}. Starts ${fmt(w.start_at)}.`, final: true }
+        ? { state, text: `Approved by ${[...approved].map((p) => this.core.principal(p)?.name ?? p).join(' and ')}${overrule ? ', overruling the decline' : ''}. Starts ${fmt(w.start_at)}.`, final: true }
         : { state, text: `${principal.name} approved (${approved.size} of ${w.approvers.length}). Waiting for ${w.approvers.filter((a) => !approved.has(a)).join(', ')}.`, final: false };
     });
   }

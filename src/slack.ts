@@ -397,11 +397,12 @@ export class SlackBridge {
 
   // No "Suggest another time" (P2): it tagged the requester's human in a card rewrite, which Slack doesn't notify, and
   // a declined agent re-requests anyway. An old card's button still works (decideFromSlackButton keeps 'suggest').
-  private windowButtons(windowId: unknown): Block {
+  private windowButtons(windowId: unknown, which: Array<'approve' | 'decline'> = ['approve', 'decline']): Block {
     const button = (action: string, label: string, style: string) => ({
       type: 'button', action_id: `sb_win_${action}`, text: { type: 'plain_text', text: label }, value: JSON.stringify({ w: windowId }), style,
     });
-    return { type: 'actions', elements: [button('approve', 'Approve', 'primary'), button('decline', 'Decline', 'danger')] };
+    const all = { approve: button('approve', 'Approve', 'primary'), decline: button('decline', 'Decline', 'danger') };
+    return { type: 'actions', elements: which.map((k) => all[k]) };
   }
 
   private names(ids: string[]): string {
@@ -426,9 +427,11 @@ export class SlackBridge {
       const by = this.names([String(b['by'])]);
       // An old card's button (windowButtons). One recorded for an approved window, before that was refused, changes nothing.
       if (b['decision'] === 'suggest') return b['state'] === 'proposed' ? open(`${by} asked for another time.`) : null;
-      if (b['decision'] === 'decline') return done(`:no_entry: ${head}. Declined by ${by}.`);
+      // Require any: until the window starts either owner can overrule the other, so the card keeps the opposite button.
+      const keep = (text: string, button: 'approve' | 'decline') => (r['require'] === 'all' ? done(text) : card(text, this.windowButtons(r['window'] ?? b['window'], [button])));
+      if (b['decision'] === 'decline') return keep(`:no_entry: ${head}. Declined by ${by}.`, 'approve');
       const approved = Array.isArray(b['approved']) ? b['approved'] as string[] : [String(b['by'])];
-      if (b['state'] === 'approved') return done(`:white_check_mark: ${head}. Approved by ${this.names(approved)}.`);
+      if (b['state'] === 'approved') return keep(`:white_check_mark: ${head}. Approved by ${this.names(approved)}.`, 'decline');
       const waiting = (Array.isArray(r['approvers']) ? r['approvers'] as string[] : []).filter((p) => !approved.includes(p));
       return open(`Approved by ${this.names(approved)}; waiting for ${waiting.length ? this.names(waiting) : 'the other approver'}.`);
     }

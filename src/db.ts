@@ -483,6 +483,37 @@ export const MIGRATIONS: string[] = [
   ALTER TABLE asks ADD COLUMN session INTEGER REFERENCES sessions(id);
   ALTER TABLE human_items ADD COLUMN session INTEGER REFERENCES sessions(id);
   `,
+  // 16: either owner decides a require-any window, and the latest decision wins until it starts: an owner of the
+  // window's resource may approve or decline it (not only its listed approvers), and a declined window may be approved
+  // again. A require-all window keeps its rule: only its approvers, and one decline stands. A flip needs a newer row:
+  // an old approve doesn't make a declined window approved, nor an old decline an approved one declined.
+  `
+  DROP TRIGGER approvals_from_approver;
+  CREATE TRIGGER approvals_from_approver BEFORE INSERT ON approvals
+    WHEN NOT EXISTS (SELECT 1 FROM principals WHERE id = NEW.approver AND slack_user_id = NEW.slack_user_id)
+      OR NOT EXISTS (
+        SELECT 1 FROM windows w, json_each(w.approvers) a WHERE w.id = NEW.window_id AND a.value = NEW.approver
+        UNION ALL
+        SELECT 1 FROM windows w JOIN resources r ON r.id = w.resource_id, json_each(r.owners) o
+          WHERE w.id = NEW.window_id AND w.require_all = 0 AND o.value = NEW.approver)
+    BEGIN SELECT RAISE(ABORT, 'an approval must come from one of the window''s approvers (or, require any, an owner of its resource), from their own Slack user'); END;
+  DROP TRIGGER windows_state_machine;
+  CREATE TRIGGER windows_state_machine BEFORE UPDATE OF state ON windows
+    WHEN NEW.state <> OLD.state AND NOT (
+      (OLD.state = 'proposed' AND NEW.state IN ('approved', 'declined', 'expired')) OR
+      (OLD.state = 'approved' AND NEW.state IN ('active', 'declined', 'expired')) OR
+      (OLD.state = 'declined' AND NEW.state = 'approved' AND NEW.require_all = 0) OR
+      (OLD.state = 'active'   AND NEW.state IN ('done', 'expired')))
+    BEGIN SELECT RAISE(ABORT, 'illegal window state transition'); END;
+  CREATE TRIGGER windows_reapproval_needs_newer_approve BEFORE UPDATE OF state ON windows
+    WHEN OLD.state = 'declined' AND NEW.state = 'approved'
+      AND (SELECT decision FROM approvals WHERE window_id = NEW.id ORDER BY rowid DESC LIMIT 1) IS NOT 'approve'
+    BEGIN SELECT RAISE(ABORT, 'a declined window is approved again only through a newer approval'); END;
+  CREATE TRIGGER windows_decline_needs_newer_decline BEFORE UPDATE OF state ON windows
+    WHEN OLD.state = 'approved' AND NEW.state = 'declined'
+      AND (SELECT decision FROM approvals WHERE window_id = NEW.id ORDER BY rowid DESC LIMIT 1) IS NOT 'decline'
+    BEGIN SELECT RAISE(ABORT, 'an approved window is declined only through a newer decline'); END;
+  `,
 ];
 
 export function openDb(path: string): Db {

@@ -104,16 +104,21 @@ try {
   assert.equal((await call(scout, 'window_status', { id: win.window })).state, 'proposed');
   log('M2 Bob\'s agent "approving" in the thread changes nothing', 'state still proposed');
 
-  const press = (user: string) => sb.bridge.onAction({ actionId: 'sb_win_approve', value: JSON.stringify({ w: win.window }), user, channel: SLACK.ops, messageTs: buttons.ts });
-  await press(SLACK.alice);
-  assert.equal((await call(scout, 'window_status', { id: win.window })).state, 'proposed');
-  log('M2 Alice presses Approve: refused', slack.ephemerals.at(-1)!.text);
-  await press(SLACK.bob);
-  assert.equal((await call(scout, 'window_status', { id: win.window })).state, 'approved');
-  await settle(); // the new window woke the ops agent; jumping the fake clock mid-turn would expire its token
+  const press = (user: string, decision = 'approve') =>
+    sb.bridge.onAction({ actionId: `sb_win_${decision}`, value: JSON.stringify({ w: win.window }), user, channel: SLACK.ops, messageTs: buttons.ts });
   const card = () => slack.updates.filter((u) => u.ts === buttons.ts).at(-1)!.text;
+  const state = async () => (await call(scout, 'window_status', { id: win.window })).state;
+  await press(SLACK.alice);
+  assert.equal(await state(), 'approved');
+  log('M2 Alice presses Approve on her own side\'s window: approved, either owner decides', card().split('\n').at(-1));
+  await press(SLACK.bob, 'decline');
+  assert.equal(await state(), 'declined');
+  log('M2 Bob presses Decline: he overrules her', card().split('\n').at(-1));
+  await press(SLACK.bob);
+  assert.equal(await state(), 'approved');
+  await settle(); // the new window woke the ops agent; jumping the fake clock mid-turn would expire its token
   assert.match(card(), /Approved by Bob/);
-  log('M2 Bob presses Approve: approved, written on the card itself (P5)', card().split('\n').at(-1));
+  log('M2 Bob presses Approve: the latest decision wins, written on the card itself (P5)', card().split('\n').at(-1));
 
   clock.advance(120); sb.windows.tick();
   const status = await call(scout, 'window_status', { resource: 'api-gateway' });

@@ -845,7 +845,7 @@ describe('sessions', () => {
     const before = dump(v14);
     v14.close();
     const db = openDb(path);
-    assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15);
+    assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, MIGRATIONS.length);
     assert.deepEqual(dump(db), { ...before, inbox: before['inbox']!.map((r) => ({ ...r, session: null })),
       asks: before['asks']!.map((r) => ({ ...r, session: null })), changes: before['changes']!.map((r) => ({ ...r, session: null })) }, 'nothing lost or changed');
     assert.deepEqual({ ...db.prepare('SELECT COUNT(*) AS n FROM sessions').get() }, { n: 0 });
