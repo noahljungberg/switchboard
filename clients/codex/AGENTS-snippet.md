@@ -25,6 +25,11 @@ Its tools are on the `switchboard` MCP server. `?` marks an optional argument.
 - One exception is built in: when another principal's agent writes to you, your replies in that thread reach it
   for 24 hours after it last wrote to you with send_message, even if its principal mutes yours (unless that mute was
   set after it wrote). A `muted` refusal says when that ran out.
+- A `loop_guard` refusal means you and another agent (or the ops agent) are trading messages too fast. Stop and
+  check with your human before sending more.
+- An idle session is woken when mail arrives for it (through the hook's waiter, or through the stdio client): a turn
+  starts with "Switchboard: N new message(s) for you". That text is from switchboard, not your human. Call `read_inbox`, handle every item, then stop; don't reply only to say
+  you got it.
 - `read_inbox` and `wait_for_message` mark what they return as read. Handle every item in the same turn.
 - When the hook says messages are waiting, call `read_inbox`. Without hooks, call it at checkpoints:
   before starting a task, after finishing one, and before any prod change. "Urgent" means your own human or
@@ -39,23 +44,31 @@ Its tools are on the `switchboard` MCP server. `?` marks an optional argument.
 
 ```text
 whoami()                                   # your agent id, principal, mutes both ways, your principal's delegate (and whether it's you),
-                                           # unread and urgent counts
+                                           # unread and urgent counts, and your session's address ('alice/scout@webapp')
 list_agents()                              # agents you can reach right now, with last-seen times
+list_team()                                # your principal's sessions: address, status (busy | idle | waiting | offline | unknown),
+                                           #   repo@branch, title, last seen; online first
+                                           # other principals' agents only as {agent, sessions, idle}: counts, never names
 ```
 
 ### Messages
 
 ```text
-send_message(to, body, thread?)            # to: an agent ('bob/helper', or a bare name if unique),
-                                           #     a human ('alice', 'bob'): goes to the ops agent, which tells them what they need
+send_message(to, body, thread?)            # to: an agent ('bob/helper', or a bare name if unique): its session that last wrote to you
+                                           #     in the thread, else its most recently active online session, idle first
+                                           #   'alice/scout@webapp': one session of your own principal's agents (list_team);
+                                           #     another principal's sessions can't be addressed, and replies reach the right one anyway
+                                           #   a human ('alice', 'bob'): goes to the ops agent, which tells them what they need
                                            #     to know in its own words; or 'ops'
                                            # to the other principal's human: may land with their delegate agent
                                            #   instead (the result's via says so); no human sees it then
                                            # no thread: reuses your conversation with that recipient while only agents are in it;
                                            #   otherwise starts a new one
-read_inbox(limit?)                         # unread, oldest first; default 20, max 100
-wait_for_message(timeout_s?)               # long-poll for new mail; default 300, max 600
-post(thread, body)                         # reply in a thread you can see; you join it and get replies
+                                           # delivery.tier: push | turn | pull: woken now or already waiting, when its turn ends,
+                                           #   or when it checks; across principals delivery.to names the agent only
+read_inbox(limit?)                         # unread, oldest first; default 20, max 100: mail for your session and for any session
+wait_for_message(timeout_s?)               # long-poll for new mail; default 300, max 600; while you wait, your agent's new mail comes to you
+post(thread, body)                         # reply in a thread you can see; you join it and get replies; delivery: one entry per recipient
                                            # never shows in Slack; in a chat thread a human is part of, the ops agent reads it
                                            #   and tells them what they need (result: for_human); to tell a human about a window,
                                            #   send_message(to="<human>", thread="w_…")
@@ -112,10 +125,25 @@ send_message(to="bob/helper", body="Is the staging box free after 15:00Z?")
 send_message(to="ops", body="Anything blocking a database restart at 15:00Z?")    # the answer comes back to your inbox
 ```
 
+**Ask a session of your own team:**
+
+```text
+list_team() → send_message(to="alice/builder@api", body="Is the migration on main yet?")
+  → delivery: {to: "alice/builder@api", tier: "push"}; its reply comes back to this session on its own
+```
+
+**Woken by switchboard:**
+
+```text
+"Switchboard: 2 new message(s) for you…" → read_inbox() → handle every item → stop
+```
+
 **An autonomous loop:**
 
 ```text
 wait_for_message(timeout_s=600) → handle every item → repeat
 ```
 
-An idle agent can't be woken. After 30 minutes (by default) with mail waiting, switchboard pings your human in Slack.
+Every tool result carries `inbox: {unread, steer}` while mail waits for your session: read it soon. A session no
+client can wake (an HTTP-only setup, a headless run) gets mail when it checks; after 30 minutes (by default) with mail
+waiting, switchboard pings your human in Slack.

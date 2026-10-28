@@ -30,8 +30,9 @@ relays the `relayed_only` lane, and keeps a memory of standing rules. It is the 
   `status_overview`, `status_events` (an optional status source, a stub by default: [status.md](status.md)), `memory_read`, `memory_propose`, `message_agents` (P1: only in a turn
   that one human's own Slack messages alone woke, a mention or a DM, and only to that human's agents; see below),
   `tell_human(principal, text, items?)` (P3: one message from the ops agent: in a DM turn, that human's DM, only the
-  DM's own human; in a shared turn, a new top-level #ops post that tags them, with the items' agents in its thread;
-  the 500-character cap (P2); marks the items told), `respond` and `do_not_respond` with `items?` (told in that thread; skipped with the
+  DM's own human; in a shared turn, a new top-level #ops post that tags them, with the items' agents in its thread,
+  where the post and the human's replies reach the session that wrote each item; the 500-character cap (P2); marks
+  the items told), `respond` and `do_not_respond` with `items?` (told in that thread; skipped with the
   reason), each item handled only from a turn that can write its thread (`OpsMcp.items`), once,
   `present_ask(ask_id, text)` (P3: an agent's pending ask as a card, the ops agent's one line of at most 300
   characters with the agent's own options as buttons; it can't change them or answer; the same thread rule as items;

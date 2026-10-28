@@ -1,10 +1,10 @@
 {
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "node ~/.codex/hooks/switchboard-hook.mjs", "timeout": 5 }] }
+      { "hooks": [{ "type": "command", "command": "SWITCHBOARD_ENV_FILE=\"$HOME/.config/switchboard/env\" node \"$HOME/.config/switchboard/switchboard.mjs\" hook codex", "timeout": 5 }] }
     ],
     "Stop": [
-      { "hooks": [{ "type": "command", "command": "node ~/.codex/hooks/switchboard-hook.mjs", "timeout": 5 }] }
+      { "hooks": [{ "type": "command", "command": "SWITCHBOARD_ENV_FILE=\"$HOME/.config/switchboard/env\" node \"$HOME/.config/switchboard/switchboard.mjs\" hook codex", "timeout": 5 }] }
     ]
   }
 }

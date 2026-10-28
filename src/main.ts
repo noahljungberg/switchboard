@@ -80,6 +80,7 @@ export async function start(options: StartOptions): Promise<Running> {
       try { windows.tick(); } catch (err) { console.error('window tick failed', err); }
       try { core.pingIdleAgents(config.idle_ping_minutes); } catch (err) { console.error('idle ping failed', err); }
       try { core.expireAsks(); } catch (err) { console.error('ask expiry failed', err); }
+      try { core.expireSessions(); } catch (err) { console.error('session expiry failed', err); }
     };
     const timers = [setInterval(() => void bridge.sweep(), 60_000), setInterval(tick, 30_000)];
     for (const t of timers) t.unref();

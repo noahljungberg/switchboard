@@ -3,7 +3,7 @@
 // Run: npm run e2e
 
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -27,6 +27,7 @@ async function call(c: Client, name: string, args: Record<string, unknown> = {})
 }
 
 const dir = mkdtempSync(join(tmpdir(), 'switchboard-e2e-'));
+process.on('exit', () => rmSync(dir, { recursive: true, force: true })); // however the run ends, a failed start included
 const config = parseConfig({
   listen: { host: '127.0.0.1', port: 0 }, data_dir: join(dir, 'data'), slack: { ops_channel: SLACK.ops },
   resources: [{ id: 'api-gateway', name: 'API gateway', owners: ['alice', 'bob'], approvers: ['bob'], max_duration_minutes: 120,
@@ -103,16 +104,21 @@ try {
   assert.equal((await call(scout, 'window_status', { id: win.window })).state, 'proposed');
   log('M2 Bob\'s agent "approving" in the thread changes nothing', 'state still proposed');
 
-  const press = (user: string) => sb.bridge.onAction({ actionId: 'sb_win_approve', value: JSON.stringify({ w: win.window }), user, channel: SLACK.ops, messageTs: buttons.ts });
-  await press(SLACK.alice);
-  assert.equal((await call(scout, 'window_status', { id: win.window })).state, 'proposed');
-  log('M2 Alice presses Approve: refused', slack.ephemerals.at(-1)!.text);
-  await press(SLACK.bob);
-  assert.equal((await call(scout, 'window_status', { id: win.window })).state, 'approved');
-  await settle(); // the new window woke the ops agent; jumping the fake clock mid-turn would expire its token
+  const press = (user: string, decision = 'approve') =>
+    sb.bridge.onAction({ actionId: `sb_win_${decision}`, value: JSON.stringify({ w: win.window }), user, channel: SLACK.ops, messageTs: buttons.ts });
   const card = () => slack.updates.filter((u) => u.ts === buttons.ts).at(-1)!.text;
+  const state = async () => (await call(scout, 'window_status', { id: win.window })).state;
+  await press(SLACK.alice);
+  assert.equal(await state(), 'approved');
+  log('M2 Alice presses Approve on her own side\'s window: approved, either owner decides', card().split('\n').at(-1));
+  await press(SLACK.bob, 'decline');
+  assert.equal(await state(), 'declined');
+  log('M2 Bob presses Decline: he overrules her', card().split('\n').at(-1));
+  await press(SLACK.bob);
+  assert.equal(await state(), 'approved');
+  await settle(); // the new window woke the ops agent; jumping the fake clock mid-turn would expire its token
   assert.match(card(), /Approved by Bob/);
-  log('M2 Bob presses Approve: approved, written on the card itself (P5)', card().split('\n').at(-1));
+  log('M2 Bob presses Approve: the latest decision wins, written on the card itself (P5)', card().split('\n').at(-1));
 
   clock.advance(120); sb.windows.tick();
   const status = await call(scout, 'window_status', { resource: 'api-gateway' });
@@ -195,6 +201,10 @@ try {
   await settle();
   assert.equal(slack.updates.filter((u) => u.ts === stdCard.ts).at(-1)!.text, ':calendar: Nightly maintenance 21:00–23:00 UTC. Approved by Bob.');
   log('P5 Alice\'s press on Bob\'s card is refused; Bob approves the schedule once, the card says so', slack.ephemerals.at(-1)!.text);
+  const offer = slack.posts.at(-1)!;
+  assert.equal(slack.posts.length, posts + 2, 'his approval offers Alice, who co-owns the gateway, a card to overrule it');
+  assert.match(offer.text, new RegExp(`^:calendar: <@${SLACK.alice}> You can now also approve or revoke nightly maintenance for .*It's approved already: nothing is needed\\.$`));
+  log('P5 either owner decides the slot: Bob\'s approval offers Alice Approve / Revoke for what she co-owns', offer.text);
 
   assert.equal((await call(scout, 'window_status', { resource: 'api-gateway' })).may_proceed, false);
   clock.t = Date.parse('2026-10-14T21:10:00Z'); sb.windows.tick();
@@ -204,14 +214,27 @@ try {
   log('P5 21:10: window_status may_proceed inside the approved slot', go.reason);
   await call(scout, 'report_window', { id: queued.change, outcome: 'done', evidence: 'gateway/health 200 on 1a2b' });
   await settle();
-  assert.equal(slack.posts.length, posts + 1, 'the report posts nothing');
+  assert.equal(slack.posts.length, posts + 2, 'the report posts nothing');
   clock.advance(140); sb.windows.tick(); // 23:30 = end + grace
   await settle();
-  const summary = slack.posts.slice(posts + 1);
+  const summary = slack.posts.slice(posts + 2);
   assert.equal(summary.length, 1);
   assert.ok(summary[0]!.text.length <= 300, 'the cap on system notices (P2)');
   assert.equal(primary.turns.length + failover.turns.length, turns, 'no ops turn for queued changes, approvals or the slot');
   log('P5 23:30: one summary for the slot, nothing else', summary[0]!.text);
+
+  // ---- Sessions: mail to an agent targets its online session, whose client's /wait wakes it ----
+  sb.core.addAgent('alice', 'builder');
+  const session = { Authorization: `Bearer ${sb.core.issueToken('alice/builder')}`, 'X-Switchboard-Session': 'claude:00000000-0000-4000-8000-0000000000e2',
+    'X-Switchboard-Presence': encodeURIComponent(JSON.stringify({ repo: 'webapp', branch: 'main', status: 'idle' })) };
+  const poll = (seconds: number) => fetch(`${sb.agentUrl}/wait?timeout_s=${seconds}`, { headers: session }).then((r) => r.json());
+  assert.deepEqual(await poll(1), { wake: [] });
+  const woken = poll(30);
+  const toBuilder = await call(scout, 'send_message', { to: 'builder', body: 'Is the migration on main?' });
+  assert.deepEqual(toBuilder.delivery, { to: 'alice/builder@webapp', tier: 'push' });
+  assert.deepEqual(await woken, { wake: [{ session: 'claude:00000000-0000-4000-8000-0000000000e2', unread: 1, steer: 0 }] });
+  assert.equal((await call(scout, 'list_team')).sessions[0].address, 'alice/builder@webapp');
+  log('Sessions: mail targets the online session and its /wait returns a wake at once; list_team shows it', JSON.stringify(toBuilder.delivery));
 
   await scout.close(); await helper.close();
   console.log('\nE2E PASSED');

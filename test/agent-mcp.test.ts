@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 import { createAgentHttpServer } from '../src/agent-mcp.ts';
 import { listen } from '../src/main.ts';
-import { call, mcpClient, world } from './fakes.ts';
+import { call, mcpClient, sid, world } from './fakes.ts';
 
 describe('agent MCP over HTTP', () => {
   const w = world('open');
@@ -24,7 +24,7 @@ describe('agent MCP over HTTP', () => {
   test('exposes the Claude Code-style tool names', async () => {
     const c = await mcpClient(url, tokens.scout);
     const names = (await c.listTools()).tools.map((t) => t.name).sort();
-    assert.deepEqual(names, ['ask_human', 'list_agents', 'post', 'read_inbox', 'read_thread', 'send_message', 'wait_for_message', 'whoami']);
+    assert.deepEqual(names, ['ask_human', 'list_agents', 'list_team', 'post', 'read_inbox', 'read_thread', 'send_message', 'wait_for_message', 'whoami']);
     await c.close();
   });
 
@@ -119,5 +119,154 @@ describe('agent MCP over HTTP', () => {
     assert.equal((await call(c, 'whoami')).json.agent, 'bob/analyst');
     w.core.revokeToken('bob/analyst');
     await assert.rejects(call(c, 'whoami'));
+  });
+});
+
+describe('sessions and wake over HTTP', () => {
+  const w = world('open');
+  const server = createAgentHttpServer({ core: w.core });
+  let url = '';
+  const tokens = { builder: w.core.issueToken('alice/builder'), helper: w.core.issueToken('bob/helper') };
+  before(async () => { url = await listen(server, '127.0.0.1', 0); });
+  after(() => { server.closeAllConnections(); server.close(); });
+  /** What the switchboard client sends: the bearer, its host, its presence, and (Claude) its session. */
+  const headers = (token: string, n: number | null, presence: Record<string, unknown> = {}, host = 'box-1'): Record<string, string> => ({
+    Authorization: `Bearer ${token}`, 'X-Switchboard-Host': host, 'X-Switchboard-Presence': encodeURIComponent(JSON.stringify(presence)),
+    ...(n === null ? {} : { 'X-Switchboard-Session': `claude:${sid(n)}` }),
+  });
+  const get = async (path: string, h: Record<string, string>): Promise<{ status: number; json: { wake?: unknown[] } }> => {
+    const r = await fetch(`${url}${path}`, { headers: h });
+    return { status: r.status, json: await r.json() };
+  };
+  /** One raw tools/call, as a stateless client (Codex) sends it, with its _meta. */
+  const toolCall = (h: Record<string, string>, name: string, meta: Record<string, unknown>) => fetch(`${url}/mcp`, {
+    method: 'POST', headers: { ...h, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {}, _meta: meta } }),
+  }).then(async (r) => JSON.parse(((await r.json()) as { result: { content: Array<{ text: string }> } }).result.content[0]!.text));
+
+  test('session headers name the session: whoami shows its address, and every result but the inbox\'s carries its unread counts; a client without them works as today', async () => {
+    const c = await mcpClient(url, tokens.builder, headers(tokens.builder, 1, { cwd: '/w/webapp', repo: 'webapp', branch: 'main', status: 'idle', title: 'Fix login' }));
+    const plain = await mcpClient(url, tokens.builder);
+    const first = await call(c, 'whoami');
+    assert.equal(first.json.session, 'alice/builder@webapp');
+    assert.equal(first.json.inbox, undefined, 'no mail: no counts');
+    w.s.scout.sendMessage('builder', 'hello');
+    assert.deepEqual((await call(c, 'whoami')).json.inbox, { unread: 1, steer: 0 });
+    const listed = (await c.callTool({ name: 'list_agents', arguments: {} })) as { content: Array<{ text: string }> };
+    assert.ok(Array.isArray(JSON.parse(listed.content[0]!.text)), 'list_agents is unchanged');
+    assert.deepEqual(JSON.parse(listed.content[1]!.text), { inbox: { unread: 1, steer: 0 } }, 'a list gets its counts next to it');
+    const old = await call(plain, 'whoami');
+    assert.equal(old.json.session, undefined);
+    assert.equal(old.json.inbox, undefined, 'a caller with no session: results as before');
+    const read = await call(c, 'read_inbox');
+    assert.equal(read.json.inbox, undefined);
+    assert.deepEqual(read.json.items.map((i: { body: { text: string } }) => i.body.text), ['hello']);
+    await c.close(); await plain.close();
+  });
+
+  test('Codex names its thread in every tools/call (_meta.threadId), which is its session, on the host the client says', async () => {
+    const meta = { threadId: sid(50), 'x-codex-turn-metadata': { session_id: sid(50), thread_id: sid(50) }, progressToken: 1 };
+    assert.equal((await toolCall(headers(tokens.builder, null, { repo: 'api' }, 'box-9'), 'whoami', meta)).session, 'alice/builder@api');
+    assert.equal((await toolCall(headers(tokens.builder, null, {}, 'box-9'), 'whoami', { 'x-codex-turn-metadata': { thread_id: sid(51) } })).session, 'alice/builder@codex', 'the turn metadata\'s thread_id too');
+    assert.deepEqual(w.core.db.prepare("SELECT key, host FROM sessions WHERE key LIKE 'codex:%' ORDER BY id").all().map((r) => ({ ...r })),
+      [{ key: `codex:${sid(50)}`, host: 'box-9' }, { key: `codex:${sid(51)}`, host: 'box-9' }]);
+  });
+
+  test('GET /wait: a wake for the caller\'s own session once mail for it arrives; it never reads mail; each message wakes once; untargeted mail and a busy session never wake', async () => {
+    const idle = headers(tokens.builder, 2, { repo: 'w2', status: 'idle' });
+    assert.deepEqual(await get('/wait?timeout_s=1', idle), { status: 200, json: { wake: [] } });
+    const pending = get('/wait?timeout_s=30', idle);
+    w.s.scout.sendMessage('alice/builder@w2', 'wake up');
+    assert.deepEqual(await pending, { status: 200, json: { wake: [{ session: `claude:${sid(2)}`, unread: 1, steer: 0 }] } });
+    assert.equal(w.core.unread('agent:alice/builder').unread, 1, 'nothing was read');
+    assert.deepEqual((await get('/wait?timeout_s=1', idle)).json, { wake: [] }, 'one wake per message');
+
+    const busy = headers(tokens.builder, 2, { repo: 'w2', status: 'busy' });
+    assert.deepEqual((await get('/wait?timeout_s=1', busy)).json, { wake: [] });
+    w.s.scout.sendMessage('alice/builder@w2', 'while busy');
+    assert.deepEqual((await get('/wait?timeout_s=1', busy)).json, { wake: [] }, 'busy: no wake');
+    assert.deepEqual((await get('/wait?timeout_s=30', idle)).json, { wake: [{ session: `claude:${sid(2)}`, unread: 2, steer: 0 }] }, 'idle again: woken at once');
+
+    w.clock.advance(3); // no session online: the next message is untargeted
+    w.s.scout.sendMessage('builder', 'for anyone');
+    assert.deepEqual((await get('/wait?timeout_s=1', idle)).json, { wake: [] }, 'untargeted mail never wakes');
+    w.s.builder.readInbox(100);
+  });
+
+  test('GET /wait from a Codex client (no session header) reaches only the codex sessions it names in X-Switchboard-Threads, and only one of two clients claims a wake', async () => {
+    await toolCall(headers(tokens.helper, null, { repo: 'api' }, 'box-9'), 'whoami', { threadId: sid(60) });
+    await toolCall(headers(tokens.helper, null, { repo: 'closed' }, 'box-9'), 'whoami', { threadId: sid(61) }); // same host; its Codex has since closed
+    const polled = (n: number) => w.core.db.prepare('SELECT polled_at FROM sessions WHERE key = ?').get(`codex:${sid(n)}`)!['polled_at'];
+    // Its own thread, one that doesn't exist, another agent's (alice/builder's, from the test above), and junk: only the first counts.
+    const named = { ...headers(tokens.helper, null, {}, 'box-9'), 'X-Switchboard-Threads': [sid(60), sid(99), sid(50), 'not-a-thread'].join(',') };
+    assert.deepEqual((await get('/wait?timeout_s=1', named)).json, { wake: [] });
+    assert.equal(polled(61), null, 'the thread it doesn\'t name isn\'t marked online');
+    assert.equal(polled(50), null, 'nor another agent\'s');
+    const both = [get('/wait?timeout_s=2', named), get('/wait?timeout_s=2', named)];
+    const sent = w.s.scout.sendMessage('bob/helper', 'for codex');
+    assert.deepEqual((await Promise.all(both)).map((r) => r.json.wake).flat(), [{ session: `codex:${sid(60)}`, unread: 1, steer: 0 }], 'one claim, for the named thread');
+    assert.equal(w.core.db.prepare('SELECT s.key FROM inbox i JOIN sessions s ON s.id = i.session WHERE i.thread_id = ? AND i.event_seq = ?').get(sent.thread, sent.seq)!['key'], `codex:${sid(60)}`);
+    w.core.forAgent(w.agents.analyst).sendMessage('bob/helper@closed', 'for the closed thread');
+    assert.deepEqual((await get('/wait?timeout_s=1', named)).json, { wake: [] }, 'never woken by a client that doesn\'t name it');
+    assert.equal(polled(61), null);
+    w.s.helper.readInbox(100);
+  });
+
+  test('GET /unread with a session: its counts and its own (targeted) mail, presence recorded, and the notices it backs tell the session; without one, exactly as before', async () => {
+    const hook = (event: string) => get(`/unread?${new URLSearchParams({ session: `claude:${sid(3)}`, event, cwd: '/w/hooked/src', repo: 'hooked', branch: 'dev', host: 'box-1' })}`,
+      { Authorization: `Bearer ${tokens.builder}` });
+    assert.deepEqual(await hook('UserPromptSubmit'), { status: 200, json: { unread: 0, steer: 0, targeted: 0 } });
+    assert.deepEqual({ ...w.core.db.prepare(`SELECT name, cwd, repo, branch, host, status, hooks FROM sessions WHERE key = 'claude:${sid(3)}'`).get() },
+      { name: 'hooked', cwd: '/w/hooked/src', repo: 'hooked', branch: 'dev', host: 'box-1', status: 'busy', hooks: 1 });
+    w.core.forAgent(w.agents.scout).sendMessage('alice/builder@hooked', 'for the hooked session');
+    w.clock.advance(3);
+    w.s.scout.sendMessage('builder', 'for anyone');
+    assert.deepEqual((await get('/unread', { Authorization: `Bearer ${tokens.builder}` })).json, { unread: 2, steer: 0 }, 'the old hook\'s call: unchanged');
+    assert.deepEqual((await hook('Stop')).json, { unread: 2, steer: 0, targeted: 1 });
+    assert.equal(w.core.db.prepare(`SELECT status FROM sessions WHERE key = 'claude:${sid(3)}'`).get()!['status'], 'idle');
+    assert.deepEqual((await get('/wait?timeout_s=1', headers(tokens.builder, 3))).json, { wake: [] }, 'the Stop block told it: no wake repeats it');
+    w.s.builder.readInbox(100);
+  });
+
+  test('GET /unread for PostToolUse names the thread a switchboard write went to, from a session whose MCP config sends none: it becomes the session\'s route; a thread it can\'t read sets nothing; the counts are as always and nothing is told', async () => {
+    const h = { Authorization: `Bearer ${tokens.builder}` };
+    const hook = (q: Record<string, string>) => get(`/unread?${new URLSearchParams({ session: `claude:${sid(8)}`, ...q })}`, h);
+    await hook({ event: 'Stop', cwd: '/w/routed' }); // the session, as its hooks make it on the old HTTP MCP config
+    const session = w.core.db.prepare(`SELECT id, name FROM sessions WHERE key = 'claude:${sid(8)}'`).get() as { id: number; name: string };
+    const mine = w.s.builder.sendMessage('helper', 'a write that names no session').thread;
+    assert.equal(w.core.route(mine, 'alice/builder'), undefined, 'the write itself noted no route');
+    const theirs = w.s.helper.sendMessage('analyst', 'bob\'s own').thread;
+    w.core.forAgent(w.agents.scout).sendMessage(`alice/builder@${session.name}`, 'targeted, not yet told');
+    const told = () => (w.core.db.prepare('SELECT COUNT(*) AS n FROM inbox_told WHERE session = ?').get(session.id) as { n: number }).n;
+    const counts = await hook({});
+    assert.deepEqual(await hook({ event: 'PostToolUse', thread: mine }), counts, 'the counts, as always');
+    assert.equal(w.core.route(mine, 'alice/builder'), session.id, 'the thread it wrote in is its route now');
+    for (const thread of [theirs, 't_000000000000', 'general', '']) assert.deepEqual(await hook({ event: 'PostToolUse', thread }), counts, `ignored: '${thread}'`);
+    assert.equal(w.core.route(theirs, 'alice/builder'), undefined, 'a thread it can\'t read sets nothing');
+    assert.equal(told(), 0, 'PostToolUse tells nothing');
+    w.s.builder.readInbox(100);
+    // Online (its rewaker polls /wait), the route beats a more recently active idle session: the reply goes to it.
+    await Promise.all([get('/wait?timeout_s=1', headers(tokens.builder, 8)), get('/wait?timeout_s=1', headers(tokens.builder, 9))]);
+    w.s.helper.post(mine, 'the reply');
+    const row = w.core.db.prepare("SELECT session FROM inbox WHERE recipient = 'agent:alice/builder' AND thread_id = ? ORDER BY id DESC LIMIT 1").get(mine) as { session: number | null };
+    assert.equal(row.session, session.id);
+    w.s.builder.readInbox(100);
+  });
+
+  test('a /wait whose client hangs up stops waiting and leaves no waiter behind', async () => {
+    const waiters = () => w.core['waiters'].get('agent:alice/builder')?.size ?? 0;
+    const until = async (ok: () => boolean) => { for (const end = Date.now() + 5000; !ok(); await new Promise((r) => setTimeout(r, 10))) if (Date.now() > end) throw new Error('timed out'); };
+    const before = waiters();
+    const hangUp = new AbortController();
+    const held = fetch(`${url}/wait?timeout_s=30`, { headers: headers(tokens.builder, 5), signal: hangUp.signal }).then(() => 'answered', () => 'hung up');
+    await until(() => waiters() === before + 1);
+    hangUp.abort();
+    assert.equal(await held, 'hung up');
+    await until(() => waiters() === before);
+  });
+
+  test('GET /wait takes timeout_s from 1 to 55', async () => {
+    for (const t of ['0', '56', 'x', '1.5']) assert.equal((await get(`/wait?timeout_s=${t}`, headers(tokens.builder, 4))).status, 400, t);
+    assert.equal((await fetch(`${url}/wait`)).status, 401);
   });
 });

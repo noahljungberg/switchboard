@@ -397,11 +397,12 @@ export class SlackBridge {
 
   // No "Suggest another time" (P2): it tagged the requester's human in a card rewrite, which Slack doesn't notify, and
   // a declined agent re-requests anyway. An old card's button still works (decideFromSlackButton keeps 'suggest').
-  private windowButtons(windowId: unknown): Block {
+  private windowButtons(windowId: unknown, which: Array<'approve' | 'decline'> = ['approve', 'decline']): Block {
     const button = (action: string, label: string, style: string) => ({
       type: 'button', action_id: `sb_win_${action}`, text: { type: 'plain_text', text: label }, value: JSON.stringify({ w: windowId }), style,
     });
-    return { type: 'actions', elements: [button('approve', 'Approve', 'primary'), button('decline', 'Decline', 'danger')] };
+    const all = { approve: button('approve', 'Approve', 'primary'), decline: button('decline', 'Decline', 'danger') };
+    return { type: 'actions', elements: which.map((k) => all[k]) };
   }
 
   private names(ids: string[]): string {
@@ -426,9 +427,11 @@ export class SlackBridge {
       const by = this.names([String(b['by'])]);
       // An old card's button (windowButtons). One recorded for an approved window, before that was refused, changes nothing.
       if (b['decision'] === 'suggest') return b['state'] === 'proposed' ? open(`${by} asked for another time.`) : null;
-      if (b['decision'] === 'decline') return done(`:no_entry: ${head}. Declined by ${by}.`);
+      // Require any: until the window starts either owner can overrule the other, so the card keeps the opposite button.
+      const keep = (text: string, button: 'approve' | 'decline') => (r['require'] === 'all' ? done(text) : card(text, this.windowButtons(r['window'] ?? b['window'], [button])));
+      if (b['decision'] === 'decline') return keep(`:no_entry: ${head}. Declined by ${by}.`, 'approve');
       const approved = Array.isArray(b['approved']) ? b['approved'] as string[] : [String(b['by'])];
-      if (b['state'] === 'approved') return done(`:white_check_mark: ${head}. Approved by ${this.names(approved)}.`);
+      if (b['state'] === 'approved') return keep(`:white_check_mark: ${head}. Approved by ${this.names(approved)}.`, 'decline');
       const waiting = (Array.isArray(r['approvers']) ? r['approvers'] as string[] : []).filter((p) => !approved.includes(p));
       return open(`Approved by ${this.names(approved)}; waiting for ${waiting.length ? this.names(waiting) : 'the other approver'}.`);
     }
@@ -462,7 +465,11 @@ export class SlackBridge {
     });
     let text: string;
     let buttons: Block[] = [];
-    if (e.type === 'standing_requested') {
+    if (e.type === 'standing_requested' && r['already'] === true) {
+      // Pairs the other owner already approved (require any): an offer to overrule, not a request (P2).
+      text = `:calendar: ${this.mention(approver)} You can now also approve or revoke nightly maintenance for ${names} (${whose}). It's approved already: nothing is needed.`;
+      buttons = [button('approve', 'Approve', 'primary'), button('revoke', 'Revoke', 'danger')];
+    } else if (e.type === 'standing_requested') {
       const n = covers.length;
       text = r['extra'] === true
         ? `:calendar: ${this.mention(approver)} Nightly maintenance also needs your OK for ${names} (${whose}).`
@@ -470,12 +477,11 @@ export class SlackBridge {
       buttons = [button('approve', 'Approve', 'primary'), button('decline', 'Decline', 'danger')];
     } else if (e.type === 'standing_void') {
       text = `:calendar: ${slot}. Void: the slot moved to ${String(e.body['start'])}–${String(e.body['end'])} UTC.`;
-    } else if (e.body['decision'] === 'approve') {
-      text = `:calendar: ${slot}. Approved by ${who}.`;
-      buttons = [button('revoke', 'Revoke', 'danger')];
     } else {
-      text = `:calendar: ${slot}. ${e.body['decision'] === 'decline' ? 'Declined' : 'Revoked'} by ${who}.`;
-      buttons = [button('approve', 'Approve', 'primary')];
+      // Either owner's latest decision wins (Windows.coverage), so a decided card keeps both: Approve overrules a later
+      // revoke by the other owner, Revoke their later approval. A press that changes nothing is refused.
+      text = `:calendar: ${slot}. ${e.body['decision'] === 'approve' ? 'Approved' : e.body['decision'] === 'decline' ? 'Declined' : 'Revoked'} by ${who}.`;
+      buttons = [button('approve', 'Approve', 'primary'), button('revoke', 'Revoke', 'danger')];
     }
     return card(text, ...(buttons.length ? [{ type: 'actions', elements: buttons }] : []));
   }

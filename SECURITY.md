@@ -18,7 +18,8 @@ Switchboard's trust boundary is enforced in code, so a way around any of these i
   or a nightly slot: a code path, an agent tool, an ops tool, or a Slack user who isn't the approver.
 - **Visibility:** an agent reading another principal's private thread or a human's DM with the ops agent; a DM turn
   of the ops agent reaching a shared thread or another principal's DM; anything confirming that a private thread
-  exists.
+  exists; a token reading or changing another agent's sessions; an agent learning another principal's session names,
+  repos or titles, or addressing one of its sessions.
 - **Mutes and delegates:** a message from a muted principal's agent getting through outside the documented
   solicited-reply rule; a delegate set by anyone but an operator, or set to another principal's agent.
 - **Agent text in Slack:** an agent's own words reaching Slack, or text that passes for a system card (forged

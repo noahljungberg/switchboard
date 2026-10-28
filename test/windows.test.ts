@@ -2,18 +2,16 @@
 // the Slack button handler, pressed by a Slack user who is an allowed approver.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { after, before, describe, test } from 'node:test';
 import { createAgentHttpServer } from '../src/agent-mcp.ts';
-import { Core, SwitchboardError } from '../src/core.ts';
+import { type ClientHints, Core, SwitchboardError } from '../src/core.ts';
 import { MIGRATIONS, openDb } from '../src/db.ts';
 import { listen } from '../src/main.ts';
 import { SlackBridge } from '../src/slack.ts';
 import { type Resource, Windows, titleFrom } from '../src/windows.ts';
-import { FakeSlack, RESOURCES, SLACK, buttonValue, call, mcpClient, world } from './fakes.ts';
+import { FakeSlack, RESOURCES, SLACK, buttonValue, call, hint, mcpClient, tempDir, world } from './fakes.ts';
 
 
 function setup(maintenance?: { start: string; duration_minutes: number }) {
@@ -43,7 +41,7 @@ const errCode = (fn: () => unknown): string => {
 
 /** The titles migration 10 gives windows with these plans, in a v9 DB like the live one. */
 function migratedTitles(plans: string[]): string[] {
-  const path = join(mkdtempSync(join(tmpdir(), 'sb-titles-')), 'switchboard.db');
+  const path = join(tempDir('sb-titles-'), 'switchboard.db');
   const v9 = new DatabaseSync(path);
   for (const m of MIGRATIONS.slice(0, 9)) v9.exec(m);
   v9.exec('PRAGMA user_version = 9');
@@ -250,6 +248,7 @@ describe('approval: only the Slack button handler, only an allowed Slack user', 
         { resource: 'api-gateway', start: '2026-10-14T14:00:00Z', duration_minutes: 30, plan: 'x', rollback: 'y', verify: 'z', urgent: true }],
       window_status: [{ id: win.window }, { resource: 'api-gateway' }],
       report_window: [{ id: win.window, outcome: 'done', evidence: 'it was approved' }],
+      list_team: [{}],
     };
     for (const token of [core.issueToken('alice/scout'), core.issueToken('bob/helper')]) {
       const c = await mcpClient(url, token);
@@ -285,16 +284,19 @@ describe('approval: only the Slack button handler, only an allowed Slack user', 
     assert.throws(() => core.db.prepare("UPDATE windows SET state = 'approved' WHERE id = ?").run(win.window), /only through approvals/);
     assert.throws(() => core.db.prepare("UPDATE windows SET state = 'active' WHERE id = ?").run(win.window), /illegal window state transition/);
     assert.throws(() => core.db.prepare("INSERT INTO approvals (window_id, approver, slack_user_id, decision, decided_at) VALUES (?, 'bob', 'UFORGED01', 'approve', 'x')").run(win.window), /own Slack user/);
-    assert.throws(() => core.db.prepare("INSERT INTO approvals (window_id, approver, slack_user_id, decision, decided_at) VALUES (?, 'alice', ?, 'approve', 'x')").run(win.window, SLACK.alice), /window's approvers/);
+    const box = windows.request(s.agents.scout, { resource: 'alice-box', start: '2026-10-14T16:00:00Z', duration_minutes: 30, plan: 'p', rollback: 'r', verify: 'v' });
+    assert.throws(() => core.db.prepare("INSERT INTO approvals (window_id, approver, slack_user_id, decision, decided_at) VALUES (?, 'bob', ?, 'approve', 'x')").run(box.window, SLACK.bob), /window's approvers/,
+      'bob neither is an approver of nor owns alice-box');
     assert.throws(() => core.db.prepare("UPDATE windows SET approvers = '[\"alice\"]' WHERE id = ?").run(win.window), /fixed once requested/);
     isProposed(); noApprovals();
 
-    // 4. Buttons pressed by the wrong people.
-    await press(win.window, SLACK.alice);
+    // 4. Buttons pressed by the wrong people: no principal, the bot, and a principal who doesn't own the resource.
     await press(win.window, SLACK.stranger);
     await press(win.window, SLACK.bot);
+    await press(box.window, SLACK.bob);
     isProposed(); noApprovals();
-    assert.match(slack.ephemerals.at(-3)!.text, /Alice can't decide windows on API gateway/);
+    assert.equal(windows.window(box.window)!.state, 'proposed');
+    assert.match(slack.ephemerals.at(-1)!.text, /Bob can't decide windows on Alice's staging box/);
 
     // 5. The allowed approver's button.
     await press(win.window, SLACK.bob);
@@ -317,15 +319,69 @@ describe('decisions', () => {
     assert.equal(windows.window(w.window)!.state, 'approved');
   });
 
-  test('decline is final; suggest only asks for another time', async () => {
+  test('suggest only asks for another time; a decline is final under require all', async () => {
     const { ask, press, windows, s } = setup();
     const w = ask();
     await press(w.window, SLACK.bob, 'suggest');
     assert.equal(windows.window(w.window)!.state, 'proposed');
+    assert.deepEqual(s.scout.readInbox().map((i) => i.body['decision']), ['suggest']);
+    const db = ask('main-db', 30, '2026-10-14T15:00:00Z');
+    await press(db.window, SLACK.alice, 'decline');
+    assert.equal(windows.window(db.window)!.state, 'declined');
+    for (const user of [SLACK.alice, SLACK.bob]) {
+      assert.equal(errCode(() => windows.decideFromSlackButton({ windowId: db.window, slackUserId: user, decision: 'approve' })), 'conflict', 'both must approve: one veto stands');
+    }
+  });
+
+  test('either owner decides a require-any window, its own side\'s too, and the latest decision wins until it starts', async () => {
+    const { ask, press, windows, slack, core, settle } = setup();
+    const w = ask(); // alice's agent asks; the listed approver is bob, but alice owns the API gateway too
+    await settle();
+    const own = () => slack.updates.filter((u) => u.ts === slack.posts[0]!.ts).at(-1)!; // the window's own card
+    await press(w.window, SLACK.alice);
+    await settle();
+    assert.equal(windows.window(w.window)!.state, 'approved', 'the requester\'s own principal may approve');
+    assert.match(own().text, /Approved by Alice/);
+    assert.ok(buttonValue(own(), 'sb_win_decline'), 'the card keeps a Decline, so the other owner can overrule');
     await press(w.window, SLACK.bob, 'decline');
-    assert.equal(windows.window(w.window)!.state, 'declined');
-    assert.equal(errCode(() => windows.decideFromSlackButton({ windowId: w.window, slackUserId: SLACK.bob, decision: 'approve' })), 'conflict');
-    assert.deepEqual(s.scout.readInbox().map((i) => i.body['decision']), ['suggest', 'decline']);
+    await settle();
+    assert.equal(windows.window(w.window)!.state, 'declined', 'the other owner overrules the approval');
+    assert.match(own().text, /Declined by Bob/);
+    assert.ok(buttonValue(own(), 'sb_win_approve'), 'the card keeps an Approve, so the decline can be overruled');
+    await press(w.window, SLACK.alice);
+    await settle();
+    assert.equal(windows.window(w.window)!.state, 'approved', 'and the decline is overruled in turn');
+    assert.match(own().text, /Approved by Alice/);
+    assert.equal(errCode(() => windows.decideFromSlackButton({ windowId: w.window, slackUserId: SLACK.bob, decision: 'approve' })), 'conflict', 'already approved');
+    const rows = core.db.prepare('SELECT approver, decision FROM approvals ORDER BY rowid').all().map((r) => ({ ...r }));
+    assert.deepEqual(rows, [{ approver: 'alice', decision: 'approve' }, { approver: 'bob', decision: 'decline' }, { approver: 'alice', decision: 'approve' }]);
+  });
+
+  test('no overruling once a window is active, or a declined one after its end', async () => {
+    const { ask, press, windows, clock, slack } = setup();
+    const w = ask(); // 14:00–14:30
+    await press(w.window, SLACK.bob);
+    clock.advance(120); // 14:00
+    windows.tick();
+    assert.equal(windows.window(w.window)!.state, 'active');
+    assert.equal(errCode(() => windows.decideFromSlackButton({ windowId: w.window, slackUserId: SLACK.alice, decision: 'decline' })), 'conflict');
+    assert.doesNotMatch(JSON.stringify(slack.updates.at(-1)!.blocks ?? []), /sb_win_/, 'an active window\'s card has no buttons');
+    const late = ask('api-gateway', 30, '2026-10-14T15:00:00Z'); // 15:00–15:30
+    await press(late.window, SLACK.bob, 'decline');
+    clock.advance(91); // 15:31
+    assert.equal(errCode(() => windows.decideFromSlackButton({ windowId: late.window, slackUserId: SLACK.alice, decision: 'approve' })), 'conflict');
+    assert.equal(windows.window(late.window)!.state, 'declined');
+  });
+
+  test('the database holds the line too: a re-approval needs a newer approve row, a decline a newer decline row', async () => {
+    const { ask, press, windows, core } = setup();
+    const w = ask();
+    await press(w.window, SLACK.bob);
+    await press(w.window, SLACK.alice, 'decline');
+    assert.throws(() => core.db.prepare("UPDATE windows SET state = 'approved' WHERE id = ?").run(w.window), /newer approval/, 'the old approve row doesn\'t count after a decline');
+    await press(w.window, SLACK.bob);
+    assert.throws(() => core.db.prepare("UPDATE windows SET state = 'declined' WHERE id = ?").run(w.window), /newer decline/, 'the old decline row doesn\'t count after an approval');
+    assert.equal(windows.window(w.window)!.state, 'approved');
   });
 
   test('a stale Approve pressed after a proposed window ended is refused, before the tick expires it', async () => {
@@ -351,6 +407,7 @@ describe('decisions', () => {
 
 describe('an urgent window in Slack is one card (P5)', () => {
   const actions = (blocks?: Array<Record<string, unknown>>) => (blocks ?? []).filter((b) => b['type'] === 'actions');
+  const ids = (blocks?: Array<Record<string, unknown>>) => actions(blocks).flatMap((b) => (b['elements'] as Array<{ action_id: string }>).map((e) => e.action_id));
 
   test('its decision, start, end and report rewrite the card in place; only the overdue page is a reply', async () => {
     const { ask, windows, clock, agents, slack, settle, bridge } = setup();
@@ -364,7 +421,7 @@ describe('an urgent window in Slack is one card (P5)', () => {
     assert.equal(slack.posts.length, 1, 'the decision is not a post of its own');
     assert.equal(last().ts, card.ts);
     assert.equal(last().text, ':white_check_mark: API gateway, 14:00–14:30 UTC: `bump gateway`. Approved by Bob.', 'one line (P2)');
-    assert.deepEqual(actions(last().blocks), [], 'the buttons are gone');
+    assert.deepEqual(ids(last().blocks), ['sb_win_decline'], 'only the button that overrules it, until it starts');
 
     clock.advance(110); // 13:50: no T-10 reminder
     assert.deepEqual(windows.tick(), []);
@@ -372,6 +429,7 @@ describe('an urgent window in Slack is one card (P5)', () => {
     windows.tick();
     await settle();
     assert.equal(last().text, ':construction: API gateway, 14:00–14:30 UTC: `bump gateway`. In progress until 14:30.');
+    assert.deepEqual(ids(last().blocks), [], 'an active window\'s card has no buttons: no overruling once it started');
     clock.advance(30); // 14:30
     windows.tick();
     await settle();
@@ -445,7 +503,7 @@ describe('an urgent window in Slack is one card (P5)', () => {
     assert.deepEqual(actions(slack.updates.at(-1)!.blocks), []);
   });
 
-  test('a stale Suggest press on an approved window changes nothing: its card keeps the approved line, without buttons (P2)', async () => {
+  test('a stale Suggest press on an approved window changes nothing: its card keeps the approved line and only its Decline (P2)', async () => {
     const { ask, slack, settle, bridge, windows, core } = setup();
     const w = ask();
     await settle();
@@ -468,18 +526,25 @@ describe('an urgent window in Slack is one card (P5)', () => {
     windows.rerenderCards();
     await settle();
     assert.equal(slack.updates.at(-1)!.text, ':white_check_mark: API gateway, 14:00–14:30 UTC: `bump gateway`. Approved by Bob.');
-    assert.deepEqual(actions(slack.updates.at(-1)!.blocks), []);
+    assert.deepEqual(ids(slack.updates.at(-1)!.blocks), ['sb_win_decline']);
   });
 
-  test('a declined card says who declined, in one line without buttons; a window on another day names its date (P2)', async () => {
+  test('a declined card says who declined, in one line with only an Approve to overrule it; a require-all card keeps none; a window on another day names its date (P2)', async () => {
     const { ask, slack, settle, press } = setup();
     const w = ask('api-gateway', 30, '2026-10-16T09:00:00Z');
     await settle();
     assert.match(slack.posts[0]!.text, /API gateway, Oct 16 09:00–09:30 UTC: `bump gateway`/);
     await press(w.window, SLACK.bob, 'decline');
     await settle();
-    assert.equal(slack.updates.at(-1)!.text, ':no_entry: API gateway, Oct 16 09:00–09:30 UTC: `bump gateway`. Declined by Bob.');
-    assert.deepEqual(actions(slack.updates.at(-1)!.blocks), []);
+    const card = (i: number) => slack.updates.filter((u) => u.ts === slack.posts[i]!.ts).at(-1)!;
+    assert.equal(card(0).text, ':no_entry: API gateway, Oct 16 09:00–09:30 UTC: `bump gateway`. Declined by Bob.');
+    assert.deepEqual(ids(card(0).blocks), ['sb_win_approve']);
+    const db = ask('main-db', 30, '2026-10-16T10:00:00Z');
+    await settle();
+    await press(db.window, SLACK.alice, 'decline');
+    await settle();
+    assert.match(card(1).text, /Declined by Alice/);
+    assert.deepEqual(ids(card(1).blocks), [], 'require all: one decline stands, so nothing to overrule');
   });
 });
 
@@ -610,11 +675,14 @@ describe('the nightly maintenance slot (P5)', () => {
     assert.equal(windows.coverage(gateway, 'alice').covered, true, 'require any: Bob\'s approval covers the gateway for Alice\'s agents');
     assert.equal(windows.coverage(gateway, 'bob').covered, true);
     assert.deepEqual(windows.coverage(windows.resource('main-db'), 'alice'), { covered: false, approvers: ['alice', 'bob'], requireAll: true, missing: ['alice'] }, 'require all: Alice must approve too');
-    assert.equal(slack.posts.length, 1, 'the decision rewrites the card');
+    assert.equal(slack.posts.filter((p) => p.text.includes(`<@${SLACK.bob}>`)).length, 1, 'the decision rewrites his card');
+    assert.equal(slack.posts.at(-1)!.text, `:calendar: <@${SLACK.alice}> You can now also approve or revoke nightly maintenance for API gateway (Alice's and Bob's agents). It's approved already: nothing is needed.`,
+      'Alice co-owns the gateway (require any): his approval offers her a card to overrule it');
     const approved = slack.updates.at(-1)!;
     assert.equal(approved.ts, card.ts);
     assert.equal(approved.text, ':calendar: Nightly maintenance 21:00–23:00 UTC. Approved by Bob.');
-    assert.deepEqual(((approved.blocks!.find((b) => b['type'] === 'actions') as { elements: Array<{ action_id: string }> }).elements).map((e) => e.action_id), ['sb_std_revoke']);
+    assert.deepEqual(((approved.blocks!.find((b) => b['type'] === 'actions') as { elements: Array<{ action_id: string }> }).elements).map((e) => e.action_id), ['sb_std_approve', 'sb_std_revoke'],
+      'both: the other owner\'s later decision can be overruled from this card');
     assert.throws(() => core.db.prepare("UPDATE standing_approvals SET decision = 'revoke'").run(), /append-only/);
     assert.throws(() => core.db.prepare('DELETE FROM standing_approvals').run(), /append-only/);
 
@@ -622,9 +690,73 @@ describe('the nightly maintenance slot (P5)', () => {
     await settle();
     assert.equal(windows.coverage(gateway, 'alice').covered, false, 'revoked');
     assert.equal(slack.updates.at(-1)!.text, ':calendar: Nightly maintenance 21:00–23:00 UTC. Revoked by Bob.');
-    assert.deepEqual(((slack.updates.at(-1)!.blocks!.find((b) => b['type'] === 'actions') as { elements: Array<{ action_id: string }> }).elements).map((e) => e.action_id), ['sb_std_approve'], 'and can approve again');
+    assert.deepEqual(((slack.updates.at(-1)!.blocks!.find((b) => b['type'] === 'actions') as { elements: Array<{ action_id: string }> }).elements).map((e) => e.action_id), ['sb_std_approve', 'sb_std_revoke'], 'and can approve again');
     assert.deepEqual(core.db.prepare('SELECT approver, slack_user_id, decision FROM standing_approvals ORDER BY id').all().map((r) => ({ ...r })),
       [{ approver: 'bob', slack_user_id: SLACK.bob, decision: 'approve' }, { approver: 'bob', slack_user_id: SLACK.bob, decision: 'revoke' }]);
+  });
+
+  test('either owner decides a require-any pair of the slot, and the latest decision wins; require all is unchanged', async () => {
+    const t = setup();
+    const gateway = t.windows.resource('api-gateway'); // owners alice and bob; the config names bob
+    const db = t.windows.resource('main-db'); // require all: alice and bob
+    t.windows.askStanding(['bob', 'alice']);
+    await t.settle();
+    const aliceCovers = t.windows.maintenance().standing.find((c) => c.approver === 'alice')!.covers;
+    assert.ok(aliceCovers.includes('api-gateway for alice\'s agents') && aliceCovers.includes('api-gateway for bob\'s agents'), 'alice owns the gateway, so her card lists it too');
+    const covered = () => [t.windows.coverage(gateway, 'alice').covered, t.windows.coverage(gateway, 'bob').covered, t.windows.coverage(db, 'alice').covered];
+    await t.standing(1, 'bob', SLACK.bob);
+    await t.standing(1, 'alice', SLACK.alice);
+    assert.deepEqual(covered(), [true, true, true], 'both approved');
+    await t.standing(1, 'alice', SLACK.alice, 'revoke');
+    assert.deepEqual(covered(), [false, false, false], 'alice revokes: the gateway follows her, the main DB needs both');
+    await t.standing(1, 'bob', SLACK.bob);
+    assert.deepEqual(covered(), [true, true, false], 'bob overrules her for the gateway from the card he had approved; her revoke stands for the main DB');
+    await t.standing(1, 'bob', SLACK.bob);
+    assert.match(t.slack.ephemerals.at(-1)!.text, /already approved this card, and it covers all of these/, 'a press that changes nothing is refused');
+    await t.standing(1, 'alice', SLACK.alice, 'revoke');
+    assert.deepEqual(covered(), [false, false, false], 'and she overrules him in turn');
+    await t.standing(1, 'alice', SLACK.alice, 'revoke');
+    assert.match(t.slack.ephemerals.at(-1)!.text, /nothing to revoke/);
+    const rows = t.core.db.prepare('SELECT approver, decision FROM standing_approvals ORDER BY id').all().map((r) => ({ ...r }));
+    assert.deepEqual(rows.map((r) => `${r['approver']} ${r['decision']}`), ['bob approve', 'alice approve', 'alice revoke', 'bob approve', 'alice revoke']);
+  });
+
+  test('an owner\'s new cards split what the other owner already approved (an offer: Approve / Revoke) from what nobody has (a request), and either can overrule', async () => {
+    const t = setup();
+    const gateway = t.windows.resource('api-gateway');
+    t.windows.askStanding(['bob']);
+    await t.settle();
+    await t.standing(1, 'bob', SLACK.bob);
+    assert.equal(t.windows.coverage(gateway, 'alice').covered, true);
+    t.windows.askStanding(['alice']);
+    await t.settle();
+    const [offer, request] = t.slack.posts.slice(-2); // the offer came with Bob's approval; the request when she was asked
+    assert.equal(request!.text, `:calendar: <@${SLACK.alice}> Nightly maintenance also needs your OK for Main DB and Alice's staging box (Alice's and Bob's agents).`,
+      'what nobody approved yet, on a card after her offer, so it names them');
+    assert.equal(offer!.text, `:calendar: <@${SLACK.alice}> You can now also approve or revoke nightly maintenance for API gateway (Alice's and Bob's agents). It's approved already: nothing is needed.`);
+    await t.bridge.onAction({ actionId: 'sb_std_decline', value: buttonValue(request!, 'sb_std_decline'), user: SLACK.alice, channel: SLACK.ops, messageTs: request!.ts });
+    assert.equal(t.windows.coverage(gateway, 'alice').covered, true, 'declining the request leaves what Bob approved alone');
+    await t.bridge.onAction({ actionId: 'sb_std_revoke', value: buttonValue(offer!, 'sb_std_revoke'), user: SLACK.alice, channel: SLACK.ops, messageTs: offer!.ts });
+    assert.equal(t.windows.coverage(gateway, 'alice').covered, false, 'her Revoke on the offer overrules his approval');
+  });
+
+  test('a card for pairs the other owner already approved says so, and offers Approve and Revoke, not a request (P2)', async () => {
+    const t = setup();
+    const shared: Resource = { id: 'shared-deploy', name: 'Shared deploys', owners: ['alice', 'bob'], approvers: ['bob'], require: 'any', max_duration_minutes: 60 };
+    const w = new Windows(t.core, [shared]);
+    w.askStanding(['bob']);
+    await t.settle();
+    await t.standing(1, 'bob', SLACK.bob);
+    assert.equal(w.coverage(shared, 'alice').covered, true);
+    w.askStanding(['alice']);
+    await t.settle();
+    const card = t.slack.posts.at(-1)!;
+    assert.equal(card.text, `:calendar: <@${SLACK.alice}> You can now also approve or revoke nightly maintenance for Shared deploys (Alice's and Bob's agents). It's approved already: nothing is needed.`);
+    const ids = ((card.blocks!.find((b) => b['type'] === 'actions') as { elements: Array<{ action_id: string }> }).elements).map((e) => e.action_id);
+    assert.deepEqual(ids, ['sb_std_approve', 'sb_std_revoke'], 'Revoke, not Decline: pressing it takes the slot away from both sides');
+    // The fixture's bridge serves the fixture's resources; this config's Windows decides its own card.
+    w.decideStandingFromSlackButton({ cardId: (JSON.parse(buttonValue(card, 'sb_std_revoke')) as { k: number }).k, slackUserId: SLACK.alice, decision: 'revoke' });
+    assert.equal(w.coverage(shared, 'alice').covered, false, 'her Revoke overrules his approval');
   });
 
   test('a standing approval covers only the resource and principal pairs its card listed: a wider config needs a new card for the new pairs', async () => {
@@ -642,7 +774,7 @@ describe('the nightly maintenance slot (P5)', () => {
     assert.match(r.next, /bob's standing approval is missing: their card was just posted in #ops/);
     await t.settle();
     const extra = t.slack.posts.at(-1)!;
-    assert.equal(t.slack.posts.length, 2, 'a second card, only for what is new');
+    assert.equal(t.slack.posts.filter((p) => p.text.includes(`<@${SLACK.bob}>`)).length, 2, 'a second card for Bob, only for what is new');
     assert.equal(extra.text, `:calendar: <@${SLACK.bob}> Nightly maintenance also needs your OK for backend deploys (Alice's and Bob's agents).`);
     assert.doesNotMatch(extra.text, /API gateway|Main DB/, 'not what his first card already listed');
     await t.bridge.onAction({ actionId: 'sb_std_approve', value: buttonValue(extra, 'sb_std_approve'), user: SLACK.bob, channel: SLACK.ops, messageTs: extra.ts });
@@ -651,7 +783,7 @@ describe('the nightly maintenance slot (P5)', () => {
     assert.equal(t.slack.updates.at(-1)!.text, ':calendar: Nightly maintenance 21:00–23:00 UTC, also for backend deploys. Approved by Bob.');
     wider.queue(t.agents.builder, { resource: 'backend-deploy', plan: 'deploy', rollback: 'revert', verify: 'curl' });
     await t.settle();
-    assert.equal(t.slack.posts.length, 2, 'nothing new to approve, nothing posted');
+    assert.equal(t.slack.posts.filter((p) => p.text.includes(`<@${SLACK.bob}>`)).length, 2, 'nothing new to approve, nothing posted');
   });
 
   test('a standing card is one line however many resources it covers; a supplementary one names them inline, clipped with "and N more" (P2)', async () => {
@@ -732,7 +864,7 @@ describe('the nightly maintenance slot (P5)', () => {
     assert.deepEqual([r.changed, r.schedule.version, r.schedule.start], [true, 2, '22:00']);
     assert.equal(windows.coverage(gateway, 'alice').covered, false, 'void: a standing approval is for one version');
     await settle();
-    const notices = slack.posts.filter((p) => !p.threadTs && p !== card);
+    const notices = slack.posts.filter((p) => !p.threadTs && p !== card && !/^:calendar:/.test(p.text)); // cards aren't announcements
     assert.equal(notices.length, 1, 'one announcement');
     assert.equal(notices[0]!.text, 'Nightly maintenance is now 22:00–00:00 UTC (was 21:00–23:00); the next slot starts Oct 14 22:00 UTC. Standing approvals for the old time are void; each approver gets a new card when a queued change needs one.');
     assert.equal((notices[0]!.blocks ?? []).at(-1)?.['type'], 'context', 'a system notice with the footer');
@@ -790,7 +922,8 @@ describe('queued changes (P5)', () => {
     t.windows.queue(t.agents.scout, { resource: 'alice-box', ...change });
     await t.settle();
     assert.equal(t.slack.posts.length, 2, 'a change that needs another approver posts their card');
-    assert.equal(t.slack.posts[1]!.text, `:calendar: <@${SLACK.alice}> Nightly maintenance 21:00–23:00 UTC for 2 shared resources (Alice's and Bob's agents). Approve once?`);
+    assert.equal(t.slack.posts[1]!.text, `:calendar: <@${SLACK.alice}> Nightly maintenance 21:00–23:00 UTC for 3 shared resources (Alice's and Bob's agents). Approve once?`,
+      'every resource she can decide: the API gateway too, which either owner decides (require any)');
 
     // A new time voids the approvals; the queued changes ask again, once per approver.
     t.windows.setSchedule({ start: '22:00', duration_minutes: 120 }, 'ops');
@@ -856,6 +989,29 @@ describe('queued changes (P5)', () => {
     assert.deepEqual(told(t.s.builder).map((x) => x[1]), ['slot_lost']);
     await t.settle();
     assert.ok(!t.slack.posts.slice(posts).some((p) => p.text.includes('no longer covers')), 'agents only, never Slack');
+  });
+
+  test('reply routing: an urgent window\'s decision and clock reach the session that requested it, a lost slot the session that queued the change', async () => {
+    const t = setup();
+    const as = (n: number, extra: ClientHints = { poll: true }) => t.core.forAgent(t.agents.scout, hint(n, { repo: `repo-${n}` }, extra));
+    const [one, two] = [as(1), as(2)];
+    t.clock.advance(1);
+    as(2, {}); // a request: two is the most recently active, so only reply routing sends anything to one
+    const w = t.windows.request(t.agents.scout, { resource: 'api-gateway', start: '2026-10-14T14:00:00Z', duration_minutes: 30, plan: 'p', rollback: 'r', verify: 'v' }, one.session!.id);
+    await t.press(w.window, SLACK.bob);
+    t.clock.t = Date.parse('2026-10-14T14:00:00Z');
+    as(1); as(2);
+    t.windows.tick();
+    assert.deepEqual(one.readInbox().map((i) => [i.type, i.body['state']]), [['window_decision', 'approved'], ['window_state', 'active']]);
+    assert.deepEqual(two.readInbox(), []);
+
+    await approve(t, 'bob');
+    const c = t.windows.queue(t.agents.scout, { resource: 'api-gateway', ...change }, one.session!.id);
+    t.clock.t = Date.parse('2026-10-14T21:10:00Z');
+    as(1); t.clock.advance(1); as(2);
+    await t.standing(1, 'bob', SLACK.bob, 'revoke');
+    assert.deepEqual(one.readInbox().map((i) => [i.type, i.body['change']]), [['slot_lost', c.change]]);
+    assert.deepEqual(two.readInbox(), []);
   });
 
   test('a resource that left config, or a principal no longer among its owners, loses the slot\'s cover by change id too', async () => {
@@ -1168,7 +1324,7 @@ describe('queued changes (P5)', () => {
 
 describe('migrations', () => {
   test('a live v7 DB keeps its windows, approvals and audit rows through every later migration; stale ops wake rows are marked read', () => {
-    const path = join(mkdtempSync(join(tmpdir(), 'sb-mig-')), 'switchboard.db');
+    const path = join(tempDir('sb-mig-'), 'switchboard.db');
     const v7 = new DatabaseSync(path);
     v7.exec('PRAGMA foreign_keys = ON;');
     for (const m of MIGRATIONS.slice(0, 7)) v7.exec(m);
@@ -1211,7 +1367,7 @@ describe('migrations', () => {
     const stale = ['approval_decision', 'window_clock', 'window_report'];
     const after = dump(db);
     assert.ok(after['mutes']!.every((m) => typeof m['set_at'] === 'string' && m['set_at'] !== ''), 'P4: migration 11 dates every mute');
-    assert.deepEqual({ ...after, mutes: after['mutes']!.map(({ set_at: _, set_mark: __, ...m }) => m) }, { ...before, inbox: before['inbox']!.map((r) => (r['recipient'] === 'ops' && stale.includes(String(r['kind'])) ? { ...r, read_at: r['created_at'] } : r)),
+    assert.deepEqual({ ...after, mutes: after['mutes']!.map(({ set_at: _, set_mark: __, ...m }) => m) }, { ...before, inbox: before['inbox']!.map((r) => ({ ...(r['recipient'] === 'ops' && stale.includes(String(r['kind'])) ? { ...r, read_at: r['created_at'] } : r), session: null })), // migration 15: untargeted
       windows: before['windows']!.map((r) => ({ ...r, title: titleFrom(String(r['plan'])) })), // P2: migration 10 adds each window's title
       principals: before['principals']!.map((r) => ({ ...r, delegate_agent_id: null })) }, // P4: migration 11, no delegate yet
       'nothing lost or changed, except stale ops wake rows marked read, a title on each window and no delegate on each principal');
@@ -1226,7 +1382,7 @@ describe('migrations', () => {
   });
 
   test('migration 10 applies to a DB whose old terms trigger is missing, and leaves the new one in place', () => {
-    const path = join(mkdtempSync(join(tmpdir(), 'sb-mig-')), 'switchboard.db');
+    const path = join(tempDir('sb-mig-'), 'switchboard.db');
     const v9 = new DatabaseSync(path);
     for (const m of MIGRATIONS.slice(0, 9)) v9.exec(m);
     v9.exec('PRAGMA user_version = 9; DROP TRIGGER windows_terms_fixed;');
@@ -1238,7 +1394,7 @@ describe('migrations', () => {
   });
 
   test('the live v9 DB keeps every row through migration 10; each window gets the title titleFrom derives from its plan, fixed like its other terms (P2)', () => {
-    const path = join(mkdtempSync(join(tmpdir(), 'sb-mig-')), 'switchboard.db');
+    const path = join(tempDir('sb-mig-'), 'switchboard.db');
     const v9 = new DatabaseSync(path);
     v9.exec('PRAGMA foreign_keys = ON;');
     for (const m of MIGRATIONS.slice(0, 9)) v9.exec(m);
@@ -1284,7 +1440,8 @@ describe('migrations', () => {
     assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, MIGRATIONS.length);
     const after = dump(db);
     assert.deepEqual(after, { ...before, windows: before['windows']!.map((r) => ({ ...r, title: titleFrom(String(r['plan'])) })),
-      principals: before['principals']!.map((r) => ({ ...r, delegate_agent_id: null })) }, 'nothing lost or changed; each window has a title, no principal a delegate (P4)');
+      principals: before['principals']!.map((r) => ({ ...r, delegate_agent_id: null })), changes: before['changes']!.map((r) => ({ ...r, session: null })) },
+      'nothing lost or changed; each window has a title, no principal a delegate (P4), no change a session (migration 15)');
     assert.deepEqual(after['windows']!.map((r) => r['title']), [
       'Raise API rate limits to 2x on web-prod-1',
       'Deploy frontend 1a2b3c (v2.1.3) to prod',
@@ -1306,7 +1463,7 @@ describe('migrations', () => {
 
 describe('migration 12', () => {
   test('a live v11 DB keeps every change, rowid included, and its triggers; withdrawn becomes a state', () => {
-    const path = join(mkdtempSync(join(tmpdir(), 'sb-mig-')), 'switchboard.db');
+    const path = join(tempDir('sb-mig-'), 'switchboard.db');
     const v11 = new DatabaseSync(path);
     v11.exec('PRAGMA foreign_keys = ON;');
     for (const m of MIGRATIONS.slice(0, 11)) v11.exec(m);
@@ -1333,7 +1490,7 @@ describe('migration 12', () => {
     v11.close();
     const db = openDb(path);
     assert.ok((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version >= 12);
-    assert.deepEqual(dump(db), before, 'every change, with its rowid (ties order by it)');
+    assert.deepEqual(dump(db), before.map((r) => ({ ...r, session: null })), 'every change, with its rowid (ties order by it), and no session (migration 15)');
     assert.equal((db.prepare("SELECT delegate_agent_id FROM principals").get() as { delegate_agent_id: string }).delegate_agent_id, 'alice/claude');
     assert.throws(() => db.prepare("UPDATE changes SET plan = 'x' WHERE id = 'c_000000000000'").run(), /fixed once queued/);
     assert.throws(() => db.prepare("UPDATE changes SET slot_day = '2026-10-22' WHERE id = 'c_000000000000'").run(), /only while it is queued/);

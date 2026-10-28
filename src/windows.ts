@@ -121,6 +121,8 @@ export interface Change {
   evidence: string | null;
   reported_at: string | null;
   created_at: string;
+  /** The session that queued it, which a lost slot steers (reply routing). */
+  session: number | null;
 }
 const OUTCOME_WORDS: Record<ChangeState, string> = { queued: 'not reported', done: 'done', rolled_back: 'rolled back', failed: 'failed', partial: 'partial', not_reported: 'not reported', withdrawn: 'withdrawn' };
 // P2: switchboard caps a system notice at 300 characters (slack.ts CARD_MAX); this leaves room for the tags to become
@@ -250,18 +252,34 @@ export class Windows {
     if (!this.resources.has(resource.id) || !resource.owners.includes(principal)) return { covered: false, approvers, requireAll, missing: [] };
     const pair: CardPair = { resource: resource.id, principal, approvers, requireAll };
     const cards = this.cards();
+    if (!requireAll) {
+      // Either owner decides a require-any pair, and the latest decision wins: one can revoke what the other approved,
+      // and the other approve it again. Each decision is still a human's own button on their own card (P1).
+      const decides = (a: string) => resource.owners.includes(a) || approvers.includes(a);
+      const ids = cards.filter((c) => decides(c.approver) && c.covers.some((p) => samePair(p, pair))).map((c) => c.id);
+      const last = ids.length ? one<{ decision: StandingDecision }>(this.core.db,
+        `SELECT decision FROM standing_approvals WHERE card_id IN (${ids.map(() => '?').join(', ')}) ORDER BY id DESC LIMIT 1`, ...ids) : undefined;
+      const covered = last?.decision === 'approve';
+      return { covered, approvers, requireAll, missing: covered ? [] : approvers };
+    }
     const approved = approvers.filter((a) => cards.some((c) => c.approver === a && c.decision === 'approve' && c.covers.some((p) => samePair(p, pair))));
-    const covered = requireAll ? approved.length === approvers.length : approved.length > 0;
+    const covered = approved.length === approvers.length;
     return { covered, approvers, requireAll, missing: covered ? [] : approvers.filter((a) => !approved.includes(a)) };
   }
 
-  /** What one approver approves under the config: each pair policy() names them for, under its approvers and mode, with the others a require-all resource needs too. */
+  /**
+   * What one approver approves under the config: each pair policy() names them for, under its approvers and mode, with
+   * the others a require-all resource needs too; and every require-any pair of a resource they own, which either owner
+   * decides (coverage), under the approvers policy() names.
+   */
   covers(approver: string): Array<CardPair & { name: string; with: string[] }> {
     const out = [];
     for (const r of this.resources.values()) {
       for (const owner of r.owners) {
         const { approvers, requireAll } = this.policy(r, owner);
-        if (approvers.includes(approver)) out.push({ resource: r.id, name: r.name, principal: owner, approvers, requireAll, with: requireAll ? approvers.filter((a) => a !== approver) : [] });
+        if (approvers.includes(approver) || (!requireAll && r.owners.includes(approver))) {
+          out.push({ resource: r.id, name: r.name, principal: owner, approvers, requireAll, with: requireAll ? approvers.filter((a) => a !== approver) : [] });
+        }
       }
     }
     return out;
@@ -273,7 +291,7 @@ export class Windows {
    * one only for what a wider or looser config added. With `need`, only when that pair isn't on one of their cards. Says where the
    * card for `need` (or their newest card) stands.
    */
-  askStanding(approvers: string[], need?: Pair): Array<{ approver: string; card: CardState }> {
+  askStanding(approvers: string[], need?: Pair, options: { offersOnly?: boolean } = {}): Array<{ approver: string; card: CardState }> {
     return tx(this.core.db, () => {
       const s = this.schedule();
       const cards = this.cards(s.version);
@@ -289,22 +307,31 @@ export class Windows {
         const needed = need && wanted.find((p) => p.resource === need.resource && p.principal === need.principal);
         if (need && !needed) return { approver, card: 'nothing_to_approve' };
         if (missing.length && (!needed || !listed(needed))) {
-          const thread = this.core.createThread({
-            kind: 'chat', visibility: 'shared', title: `Nightly maintenance: ${principal.name}'s standing approval`, key: `standing:${s.version}:${approver}`,
-            participants: [principalActor(approver)],
-          });
-          const id = run(this.core.db, 'INSERT INTO standing_cards (version, approver, covers, thread_id, posted_at) VALUES (?, ?, ?, ?, ?)',
-            s.version, approver, JSON.stringify(missing.map((p) => [p.resource, p.principal, p.requireAll ? 'all' : 'any', [...p.approvers].sort()])), thread.id, this.core.iso()).lastInsertRowid;
-          // Grouped by resource for the card; the DB row is what the approval counts.
-          const byResource = new Map<string, { resource: string; name: string; principals: string[]; with: string[] }>();
-          for (const p of missing) {
-            const g = byResource.get(p.resource) ?? { resource: p.resource, name: p.name, principals: [], with: [] };
-            g.principals.push(p.principal);
-            g.with = [...new Set([...g.with, ...p.with])];
-            byResource.set(p.resource, g);
-          }
-          this.core.append(thread.id, 'system', 'standing_requested', {
-            card: id, version: s.version, approver, start: s.start, end: endOf(s), duration_minutes: s.duration_minutes, covers: [...byResource.values()], extra: mine.length > 0,
+          // Pairs the other owner's approval already covers (require any) go on a card of their own, an offer to
+          // overrule ("nothing is needed", Approve / Revoke); the rest on a request (Approve / Decline). So a Decline
+          // meant for what nobody approved yet can't take away what the other owner did.
+          const coveredPair = (p: CardPair) => !p.requireAll && this.coverage(this.resources.get(p.resource)!, p.principal).covered;
+          const groups = [options.offersOnly ? [] : missing.filter((p) => !coveredPair(p)), missing.filter(coveredPair)].filter((g) => g.length);
+          if (!groups.length) return { approver, card: 'nothing_to_approve' };
+          groups.forEach((group, i) => {
+            const thread = this.core.createThread({
+              kind: 'chat', visibility: 'shared', title: `Nightly maintenance: ${principal.name}'s standing approval`, key: `standing:${s.version}:${approver}`,
+              participants: [principalActor(approver)],
+            });
+            const id = run(this.core.db, 'INSERT INTO standing_cards (version, approver, covers, thread_id, posted_at) VALUES (?, ?, ?, ?, ?)',
+              s.version, approver, JSON.stringify(group.map((p) => [p.resource, p.principal, p.requireAll ? 'all' : 'any', [...p.approvers].sort()])), thread.id, this.core.iso()).lastInsertRowid;
+            // Grouped by resource for the card; the DB row is what the approval counts.
+            const byResource = new Map<string, { resource: string; name: string; principals: string[]; with: string[] }>();
+            for (const p of group) {
+              const g = byResource.get(p.resource) ?? { resource: p.resource, name: p.name, principals: [], with: [] };
+              g.principals.push(p.principal);
+              g.with = [...new Set([...g.with, ...p.with])];
+              byResource.set(p.resource, g);
+            }
+            this.core.append(thread.id, 'system', 'standing_requested', {
+              card: id, version: s.version, approver, start: s.start, end: endOf(s), duration_minutes: s.duration_minutes, covers: [...byResource.values()],
+              extra: mine.length > 0 || i > 0, already: group.every(coveredPair),
+            });
           });
           return { approver, card: 'posted' };
         }
@@ -339,7 +366,7 @@ export class Windows {
       this.core.append(thread.id, 'system', 'slot_lost', {
         change: c.id, resource: c.resource_id,
         text: `The maintenance slot no longer covers ${c.resource_id} for your change ${c.id}: stop, leave prod in a known state, and report_window(id: "${c.id}") with what you did.`,
-      }, [{ recipient: agentActor(c.agent_id), priority: 'steer' }]);
+      }, [{ recipient: agentActor(c.agent_id), priority: 'steer', prefer: c.session ?? undefined }]);
     }
   }
 
@@ -404,10 +431,17 @@ export class Windows {
         throw new SwitchboardError('conflict', `this card is for an older maintenance time; it's now ${span(s)} UTC. A new card comes when a queued change needs it.`);
       }
       if (principal.id !== card.approver) throw new SwitchboardError('forbidden', `this card is ${this.core.principal(card.approver)?.name ?? card.approver}'s; only they can decide it.`);
-      const last = this.cards(s.version).find((c) => c.id === card.id)?.decision ?? null;
-      if (input.decision === 'approve' && last === 'approve') throw new SwitchboardError('conflict', 'you already approved this card.');
+      const mine = this.cards(s.version).find((c) => c.id === card.id)!;
+      const last = mine.decision;
+      // The latest decision wins for a require-any pair (coverage), so a card's Approve or Revoke can overrule the
+      // other owner's; a press that would change nothing is refused.
+      const anyPairs = mine.covers.filter((p) => !p.requireAll && this.resources.has(p.resource));
+      const coveredNow = anyPairs.map((p) => this.coverage(this.resources.get(p.resource)!, p.principal).covered);
+      if (input.decision === 'approve' && last === 'approve' && coveredNow.every(Boolean)) {
+        throw new SwitchboardError('conflict', 'you already approved this card, and it covers all of these.');
+      }
       if (input.decision === 'decline' && last) throw new SwitchboardError('conflict', last === 'approve' ? 'you approved this card; press Revoke to withdraw it.' : 'this card isn\'t approved.');
-      if (input.decision === 'revoke' && last !== 'approve') throw new SwitchboardError('conflict', 'nothing to revoke: this card isn\'t approved.');
+      if (input.decision === 'revoke' && last !== 'approve' && !coveredNow.some(Boolean)) throw new SwitchboardError('conflict', 'nothing to revoke: none of these is covered now.');
       const covered = this.coveredNow();
       run(this.core.db, 'INSERT INTO standing_approvals (card_id, approver, slack_user_id, decision, decided_at) VALUES (?, ?, ?, ?, ?)',
         card.id, principal.id, input.slackUserId, input.decision, this.core.iso());
@@ -415,6 +449,14 @@ export class Windows {
         card: card.id, version: s.version, approver: principal.id, decision: input.decision, start: s.start, end: endOf(s),
       });
       this.steerLost(covered);
+      // An approval covers the other owners' require-any pairs too: give each of them an offer card for what they can
+      // now overrule, once per version (askStanding posts only pairs none of their cards lists yet).
+      if (input.decision === 'approve') {
+        const others = new Set(mine.covers.filter((p) => !p.requireAll && this.resources.has(p.resource))
+          .flatMap((p) => [...this.resources.get(p.resource)!.owners, ...p.approvers]));
+        others.delete(principal.id);
+        if (others.size) this.askStanding([...others].filter((o) => this.core.principal(o)), undefined, { offersOnly: true });
+      }
       return { text: `${input.decision === 'approve' ? 'Approved' : input.decision === 'decline' ? 'Declined' : 'Revoked'}: nightly maintenance ${span(s)} UTC.` };
     });
   }
@@ -434,17 +476,18 @@ export class Windows {
   /**
    * request_window without urgent (P5): queues a change for nextSlot() (the one running now, unless that day's
    * slot already ran). No window, no Slack post, no ops wake. The only thing it may post is a standing-approval
-   * card, to an approver the change needs whose cards for this schedule version don't list it yet.
+   * card, to an approver the change needs whose cards for this schedule version don't list it yet. `session`: the agent's
+   * session that queued it, which a lost slot steers.
    */
-  queue(agent: Agent, input: { resource: string; start?: string | undefined; duration_minutes?: number | undefined; plan: string; rollback: string; verify: string }) {
+  queue(agent: Agent, input: { resource: string; start?: string | undefined; duration_minutes?: number | undefined; plan: string; rollback: string; verify: string }, session: number | null = null) {
     const resource = this.resource(input.resource);
     this.requireOwner(agent, resource);
     for (const k of ['plan', 'rollback', 'verify'] as const) checkBody(input[k], k);
     return tx(this.core.db, () => {
       const slot = this.nextSlot();
       const id = newId('c');
-      run(this.core.db, 'INSERT INTO changes (id, agent_id, resource_id, plan, rollback, verify, slot_day, slot_start, slot_end, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        id, agent.id, resource.id, input.plan, input.rollback, input.verify, slot.day, slot.start, slot.end, this.core.iso());
+      run(this.core.db, 'INSERT INTO changes (id, agent_id, resource_id, plan, rollback, verify, slot_day, slot_start, slot_end, created_at, session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        id, agent.id, resource.id, input.plan, input.rollback, input.verify, slot.day, slot.start, slot.end, this.core.iso(), session);
       const cov = this.coverage(resource, agent.principal_id);
       const when = `${slot.active ? 'the maintenance slot running now' : 'the next maintenance slot'}, ${fmt(slot.start)} to ${fmt(slot.end, true)}`;
       const says: Record<CardState, (a: string) => string> = {
@@ -471,9 +514,10 @@ export class Windows {
 
   /**
    * request_window with urgent (P5): a window of its own, approved by its own Slack button. For what can't wait for the
-   * slot. Its card shows `title` (default: the plan's first sentence), never the plan, rollback or verify (P2).
+   * slot. Its card shows `title` (default: the plan's first sentence), never the plan, rollback or verify (P2). `session`: the
+   * agent's session that asked, which the window's decision, clock and reports reach (its thread's route).
    */
-  request(agent: Agent, input: { resource: string; start?: string | undefined; duration_minutes?: number | undefined; plan: string; rollback: string; verify: string; title?: string | undefined }) {
+  request(agent: Agent, input: { resource: string; start?: string | undefined; duration_minutes?: number | undefined; plan: string; rollback: string; verify: string; title?: string | undefined }, session: number | null = null) {
     const resource = this.resource(input.resource);
     this.requireOwner(agent, resource);
     for (const k of ['plan', 'rollback', 'verify'] as const) checkBody(input[k], k);
@@ -521,6 +565,7 @@ export class Windows {
         window: thread.id, resource: resource.id, resource_name: resource.name, note: resource.note ?? null, title,
         start: startAt, end: endAt, minutes, plan: input.plan, rollback: input.rollback, verify: input.verify, approvers, require: resource.require,
       });
+      if (session !== null) this.core.noteRoute(thread.id, agent.id, session);
       const pending = this.overlapping(resource.id, startAt, endAt, ['proposed'], thread.id).map((w) => w.id);
       // The card shows only the title, so say which, and ask for one when the plan's first sentence says little.
       const poor = title === 'maintenance' || title.endsWith('…') || Array.from(title).length < 12;
@@ -771,31 +816,41 @@ export class Windows {
         this.core.append(w.id, actor, 'window_decision', { window: w.id, decision: 'suggest', by: principal.id, state: w.state, requested_by: w.requested_by }, requester);
         return { state: w.state, text: `${principal.name} asked for another time. Reply in the thread with one; the requester re-requests.`, final: false };
       }
-      if (!w.approvers.includes(principal.id)) {
-        throw new SwitchboardError('forbidden', `${principal.name} can't decide windows on ${resource.name}. Approvers: ${w.approvers.join(', ')}.`);
+      // Either owner decides a require-any window, its own side's too, and the latest decision wins until it starts: an
+      // approval can be declined, and a decline approved again. A require-all window keeps its rule: only its
+      // approvers decide, and one decline stands (migration 16 enforces both).
+      const decides = w.approvers.includes(principal.id) || (!w.require_all && resource.owners.includes(principal.id));
+      if (!decides) {
+        const who = w.require_all ? w.approvers : [...new Set([...resource.owners, ...w.approvers])];
+        throw new SwitchboardError('forbidden', `${principal.name} can't decide windows on ${resource.name}. ${w.require_all ? 'Approvers' : 'Its owners decide'}: ${who.join(', ')}.`);
       }
       if (input.decision === 'decline') {
         if (w.state !== 'proposed' && w.state !== 'approved') throw new SwitchboardError('conflict', `window is already ${w.state}.`);
+        const overruled = w.state === 'approved';
         this.insertApproval(w.id, principal.id, input.slackUserId, 'decline');
         this.setState(w, 'declined');
         this.core.append(w.id, actor, 'window_decision', { window: w.id, decision: 'decline', by: principal.id, state: 'declined', requested_by: w.requested_by }, requester);
-        return { state: 'declined', text: `Declined by ${principal.name}.`, final: true };
+        return { state: 'declined', text: `Declined by ${principal.name}${overruled ? ', overruling the approval' : ''}.`, final: true };
       }
-      if (w.state !== 'proposed') throw new SwitchboardError('conflict', `window is already ${w.state}.`);
+      const overrule = w.state === 'declined' && !w.require_all;
+      if (w.state !== 'proposed' && !overrule) throw new SwitchboardError('conflict', `window is already ${w.state}.`);
       // A stale button can be pressed after the end but before the 30 s tick expires the window.
       if (this.core.iso() >= w.end_at) throw new SwitchboardError('conflict', `this window ended at ${fmt(w.end_at)} without approval. Ask the requester for a new one.`);
-      const already = one(this.core.db, "SELECT 1 FROM approvals WHERE window_id = ? AND approver = ? AND decision = 'approve'", w.id, principal.id);
+      // Require all counts one approval per approver; require any is decided by the first approval (or the latest, after a decline).
+      const already = w.require_all && one(this.core.db, "SELECT 1 FROM approvals WHERE window_id = ? AND approver = ? AND decision = 'approve'", w.id, principal.id);
       if (already) throw new SwitchboardError('conflict', `${principal.name} already approved this window.`);
       const clash = this.overlapping(w.resource_id, w.start_at, w.end_at, ['approved', 'active'], w.id);
       if (clash.length) throw new SwitchboardError('conflict', `it now overlaps ${clash.map((c) => c.id).join(', ')} (${clash[0]!.state}). Decline one of them first.`);
       this.insertApproval(w.id, principal.id, input.slackUserId, 'approve');
-      const approved = new Set(all<{ approver: string }>(this.core.db, "SELECT approver FROM approvals WHERE window_id = ? AND decision = 'approve'", w.id).map((r) => r.approver));
+      const approved = new Set(w.require_all
+        ? all<{ approver: string }>(this.core.db, "SELECT approver FROM approvals WHERE window_id = ? AND decision = 'approve'", w.id).map((r) => r.approver)
+        : [principal.id]); // require any: the approval that decides it now
       const done = w.require_all ? w.approvers.every((a) => approved.has(a)) : true;
       if (done) this.setState(w, 'approved');
       const state: WindowState = done ? 'approved' : 'proposed';
       this.core.append(w.id, actor, 'window_decision', { window: w.id, decision: 'approve', by: principal.id, state, approved: [...approved], requested_by: w.requested_by, start: w.start_at }, requester);
       return done
-        ? { state, text: `Approved by ${[...approved].map((p) => this.core.principal(p)?.name ?? p).join(' and ')}. Starts ${fmt(w.start_at)}.`, final: true }
+        ? { state, text: `Approved by ${[...approved].map((p) => this.core.principal(p)?.name ?? p).join(' and ')}${overrule ? ', overruling the decline' : ''}. Starts ${fmt(w.start_at)}.`, final: true }
         : { state, text: `${principal.name} approved (${approved.size} of ${w.approvers.length}). Waiting for ${w.approvers.filter((a) => !approved.has(a)).join(', ')}.`, final: false };
     });
   }

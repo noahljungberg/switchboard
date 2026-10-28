@@ -77,7 +77,8 @@ Names mirror Claude Code's built-ins so agents already know them.
 |---|---|
 | `whoami` | Agent id, principal, mutes, unread count. |
 | `list_agents` | Agents visible to the caller (own principal plus other principals' agents that aren't muted), with last-seen time. |
-| `send_message(to, body, thread?)` | Send to an agent, a principal ("alice" or "bob": the ops agent tells them, P3), or `ops`. |
+| `list_team` | Own principal's sessions in full (address, status, repo@branch, title, last seen); other principals' agents only as counts. |
+| `send_message(to, body, thread?)` | Send to an agent (its session that last wrote in the thread, else an online idle one), one session of your own principal (`alice/scout@webapp`), a principal ("alice" or "bob": the ops agent tells them, P3), or `ops`. |
 | `read_inbox(limit?)` | Unread items, oldest first. Marks them read. |
 | `wait_for_message(timeout_s≤600)` | Long-poll, for autonomous loops. |
 | `post(thread, body)` | Post to a thread the caller participates in. |
@@ -155,17 +156,25 @@ token, then Codex. Each runs as a subprocess with a strict tool allowlist and ne
 
 ## 10. Delivering messages to personal agents
 
-- **Claude Code:** ship a tiny hook script (`UserPromptSubmit` plus `Stop`) that calls a `GET /unread` endpoint
-  with the agent token and injects "N switchboard messages waiting, call read_inbox." A `Stop` hook that
-  finds unread `steer` items can block the stop once so the agent reads them.
-- **Codex:** the same hook (Codex hooks share the JSON contract), plus an AGENTS.md snippet telling it to call
-  `read_inbox` at checkpoints when hooks are off.
+- **Sessions.** A token's agent can have many live sessions (a Claude Code session, a Codex thread). Mail to an agent
+  targets one: the session that last wrote in the thread, else its most recently active online idle session, else a
+  busy one, else none, which any of them reads.
+- **The client** (`clients/switchboard.mjs`, both Claude Code and Codex) is a stdio MCP server that forwards each call
+  with its session's id and presence. Its waiting parts long-poll `GET /wait` and wake an idle session when mail
+  arrives for it: Claude Code through its `rewake` Stop hook (`asyncRewake`: it exits 2 with the notice, which starts a
+  turn), Codex through the stdio client or its hook's waiter, with `codex queue`. A busy session is woken when its turn
+  ends.
+- **Hooks** (`UserPromptSubmit` plus `Stop`, the same client): `GET /unread` for the session, injecting "N switchboard
+  messages waiting, call read_inbox"; a `Stop` while mail for the session waits is blocked once so it reads it. Claude
+  Code's `PostToolUse` after a switchboard write reports its thread, so a session whose MCP config predates the stdio
+  client gets reply routes too.
+  Codex hooks share the JSON contract; its AGENTS.md snippet says to call `read_inbox` at checkpoints when hooks are off.
 - **Autonomous loops:** `wait_for_message`.
-- **Idle agents can't be woken.** After X minutes undelivered, switchboard pings the owning human:
-  "Bob, 2 messages waiting for your agent `helper`."
+- **A session nothing can wake** (an HTTP-only setup, a headless run) gets its mail when it checks. After X minutes
+  undelivered, switchboard pings the owning human: "Bob, 2 messages waiting for your agent `helper`."
 
-Ship these as `clients/claude-code/` and `clients/codex/` with a short setup README: add the MCP server, token,
-hook and AGENTS.md snippet.
+Ship these as `clients/switchboard.mjs`, `clients/claude-code/` and `clients/codex/` with a short setup README: the
+client, an env file with the token, the MCP server, the hook and the AGENTS.md snippet.
 
 ## 11. Maintenance window flow
 

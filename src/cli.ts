@@ -29,9 +29,10 @@ admin commands:
   list                                                principals (with their delegate), agents, mutes
   export-thread <thread-id>                           dump a thread as markdown
   memory-revert <sha>                                 revert one ops memory commit
-  ask-standing <principal>                            post their nightly-maintenance card now, so they can approve
+  ask-standing <principal> [--offers-only]            post their nightly-maintenance card now, so they can approve
                                                       before the first queued change (nothing if their cards already
-                                                      list all they approve)
+                                                      list all they approve); --offers-only: only the card for what
+                                                      another owner already approved (Approve / Revoke), no request
   rerender-cards                                      rewrite every standing card and live urgent-window card in Slack in
                                                       the current format, on its own message (the service does it on its
                                                       next sweep; nothing is posted)
@@ -42,7 +43,7 @@ config path defaults to $SWITCHBOARD_CONFIG, then ./config.yaml.`;
 export async function main(argv: string[], out: (s: string) => void = console.log): Promise<number> {
   const { values, positionals } = parseArgs({
     args: argv, allowPositionals: true,
-    options: { config: { type: 'string' }, name: { type: 'string' }, slack: { type: 'string' }, help: { type: 'boolean', short: 'h' } },
+    options: { config: { type: 'string' }, name: { type: 'string' }, slack: { type: 'string' }, 'offers-only': { type: 'boolean' }, help: { type: 'boolean', short: 'h' } },
   });
   const [mode, command, ...rest] = positionals;
   if (values.help || !mode) { out(USAGE); return mode ? 0 : 2; }
@@ -137,8 +138,10 @@ export async function main(argv: string[], out: (s: string) => void = console.lo
           throw new SwitchboardError('invalid', `${p.id} approves none of the configured resources, so a card would cover nothing. Check approvers and owners in config.yaml.`);
         }
         const s = windows.schedule();
-        const card = windows.askStanding([p.id])[0]!.card;
-        core.audit('admin', 'ask_standing', { principal: p.id, version: s.version, card });
+        const offersOnly = values['offers-only'] === true;
+        const card = windows.askStanding([p.id], undefined, { offersOnly })[0]!.card;
+        core.audit('admin', 'ask_standing', { principal: p.id, version: s.version, card, ...(offersOnly ? { offers_only: true } : {}) });
+        if (offersOnly && card === 'nothing_to_approve') { out(`nothing to offer ${p.id}: nobody else's approval covers what they can decide yet; nothing posted`); break; }
         out(card === 'posted' ? `posted ${p.id}'s standing-approval card for nightly maintenance ${span(s)} UTC (schedule v${s.version}); the service shows it in #ops on its next sweep, within a minute`
           : card === 'approved' ? `${p.id} already approved schedule v${s.version}; nothing posted`
           : `${p.id}'s card for schedule v${s.version} was already posted${card === 'waiting' ? '' : ` (they ${card} it; its Approve button still works)`}; nothing posted`);

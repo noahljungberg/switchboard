@@ -2,15 +2,15 @@
 // config handling, quota detection and session recovery. No network, no real model.
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { type Options, query } from '@anthropic-ai/claude-agent-sdk';
 import { ClaudeEngine, ClaudeSdkEngine, CodexEngine, EngineError, OPS_MODEL, SessionLostError, claudeArgs, parseResetAt } from '../src/engines.ts';
+import { tempDir } from './fakes.ts';
 
 const STUB = (name: string) => new URL(`./stubs/${name}`, import.meta.url).pathname;
-const tmp = () => mkdtempSync(join(tmpdir(), 'sb-engine-'));
+const tmp = () => tempDir('sb-engine-');
 const req = (cwd: string, session: string | null = null) => ({ session, prompt: 'Turn for thread t_1.', systemPrompt: 'You are the ops agent.', mcp: { url: 'http://127.0.0.1:9/mcp', token: 'ops_secret' }, cwd });
 const records = (home: string) => readdirSync(home).filter((f) => f.startsWith('record-')).sort().map((f) => JSON.parse(readFileSync(join(home, f), 'utf8')));
 
@@ -160,11 +160,15 @@ describe('ClaudeSdkEngine (Agent SDK on API credits) with a fake query()', () =>
 
   test('passes the same confinement as the CLI and reports the cost', async () => {
     const seen: any[] = [];
-    process.env['SLACK_BOT_TOKEN'] = 'not-for-the-engine';
+    // engineEnv passes LANG and TZ through, so pin them: the runner's own environment must not change the expected keys.
+    const saved = { LANG: process.env['LANG'], TZ: process.env['TZ'] };
+    Object.assign(process.env, { SLACK_BOT_TOKEN: 'not-for-the-engine', LANG: 'C.UTF-8', TZ: 'UTC' });
     const runDir = tmp();
     const engine = new ClaudeSdkEngine({ apiKey: 'sk-test', home: tmp(), runDir, query: fakeQuery([{ type: 'result', subtype: 'success', is_error: false, result: 'done', session_id: 's-1', total_cost_usd: 0.042 }], seen) });
-    const r = await engine.turn(req(tmp()));
-    delete process.env['SLACK_BOT_TOKEN'];
+    const r = await engine.turn(req(tmp())).finally(() => {
+      delete process.env['SLACK_BOT_TOKEN'];
+      for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    });
     assert.deepEqual(r, { session: 's-1', text: 'done', costUsd: 0.042 });
     const o = seen[0].options;
     assert.equal(o.model, 'claude-opus-5-5');
@@ -176,7 +180,7 @@ describe('ClaudeSdkEngine (Agent SDK on API credits) with a fake query()', () =>
     assert.equal(o.extraArgs.restricted, null);
     assert.equal(o.mcpServers, undefined, 'the SDK would put mcpServers, token and all, in argv');
     assert.equal(join(o.extraArgs['mcp-config'], '..'), runDir, 'the MCP config is a file in the private run dir');
-    assert.deepEqual(Object.keys(o.env).sort(), ['ANTHROPIC_API_KEY', 'CLAUDE_AGENT_SDK_CLIENT_APP', 'HOME', 'PATH'].filter((k) => k !== 'PATH' || process.env['PATH']).sort());
+    assert.deepEqual(Object.keys(o.env).sort(), ['ANTHROPIC_API_KEY', 'CLAUDE_AGENT_SDK_CLIENT_APP', 'HOME', 'LANG', 'PATH', 'TZ'].filter((k) => k !== 'PATH' || process.env['PATH']).sort());
     assert.equal(o.resume, undefined, 'fresh turn');
     assert.ok(!JSON.stringify(o).includes('bypass'));
   });

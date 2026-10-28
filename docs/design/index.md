@@ -6,7 +6,7 @@ otherwise).
 
 | Component | Doc | Files | Milestone | Status |
 |---|---|---|---|---|
-| Core: threads, events, inbox, visibility, mutes, relays, tokens | [core.md](core.md) | `src/core.ts`, `src/db.ts` | M1 | complete |
+| Core: threads, events, inbox, visibility, mutes, relays, tokens, sessions | [core.md](core.md) | `src/core.ts`, `src/db.ts` | M1 | complete |
 | Agent MCP server (personal agents) | [agent-mcp.md](agent-mcp.md) | `src/agent-mcp.ts` | M1 | complete |
 | Slack: port, Bolt adapter, mirror, inbound routing | [slack.md](slack.md) | `src/slack.ts` | M1 | complete |
 | Service: config, wiring, admin CLI | [service.md](service.md) | `src/config.ts`, `src/main.ts`, `src/cli.ts` | M1 | complete |

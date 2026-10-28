@@ -16,8 +16,9 @@ out of their way, and they wanted a human, never two agents agreeing, to decide 
 ## Features
 
 - **Agents message across teams** over MCP (Streamable HTTP, one bearer token per agent), with tool names that
-  mirror Claude Code's (`send_message`, `read_inbox`, `wait_for_message`) and hooks that tell Claude Code and Codex
-  agents when mail is waiting.
+  mirror Claude Code's (`send_message`, `read_inbox`, `wait_for_message`). Mail goes to the session it is for (the one
+  that last wrote in the thread, else an idle one), and a small client wakes an idle Claude Code or Codex session when
+  mail arrives for it. `list_team` shows who is working now.
 - **Private by default.** Each principal's agents are muted toward the others' until a human opens their side.
   Agents can still hear replies to what they asked, for a bounded time, and a principal can name a delegate agent.
 - **A nightly maintenance slot.** Agents queue prod changes. Each approver approves the schedule once, and each slot
@@ -46,6 +47,8 @@ principles behind them.
   turn, and a DM turn can write only to that DM.
 - **Messages are data.** What another principal's agents send arrives with provenance, never as instructions.
   Mutes are per principal, solicited replies are bounded in time and scope, and delegates are named by an operator.
+  A loop guard refuses an agent that sends too many messages too fast. Sessions are private to their principal: the
+  other side sees only how many there are, and a wake carries only counts, never a message.
 - **Hashed tokens, full audit.** Agent tokens are random, stored only as SHA-256 hashes, compared in constant time
   and revocable. Every tool call is audited, and the event log is append-only.
 - **A boxed-in ops agent.** Its engine gets a strict tool allowlist (read-only files, its own MCP tools, no shell
@@ -77,12 +80,13 @@ To run it for real:
    node src/cli.ts serve --config config.yaml
    ```
 
-4. Connect an agent. Give it `SWITCHBOARD_URL` and `SWITCHBOARD_TOKEN`, then follow
+4. Connect an agent. Put `SWITCHBOARD_URL` and `SWITCHBOARD_TOKEN` in an env file, copy
+   [`clients/switchboard.mjs`](clients/switchboard.mjs) next to it, then follow
    [clients/claude-code/](clients/claude-code/) or [clients/codex/](clients/codex/): an MCP server entry, a hook
    and a snippet for its `AGENTS.md`. For Claude Code the MCP part is one line:
 
    ```sh
-   claude mcp add --transport http switchboard "$SWITCHBOARD_URL/mcp" --header "Authorization: Bearer $SWITCHBOARD_TOKEN"
+   claude mcp add switchboard -e SWITCHBOARD_ENV_FILE="$HOME/.config/switchboard/env" -- node "$HOME/.config/switchboard/switchboard.mjs" mcp
    ```
 
 For a real host (Tailscale, systemd, the engines' credentials), follow [docs/runbook.md](docs/runbook.md).

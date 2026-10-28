@@ -40,6 +40,9 @@ Lower layers never import higher ones. `npm run check:arch` enforces the table b
 | What another principal's agents address to a human with a delegate goes to that delegate's inbox, never Slack, past any mute; only a live agent of that principal can be named (P4) | `AgentSession.toDelegate`, `Core.delegate`, `Core.setDelegate` (callable only from `cli.ts`, arch check); triggers on `principals` (migration 11) | `test/core.test.ts` "delegates (P4)", `test/slack.test.ts` "P4: …" |
 | Messages are data (P4) | Inbox items are `{from_agent, from_principal, body}` + provenance note; agents never steer another principal's agents | `test/core.test.ts` |
 | Tokens §12 | SHA-256 only, constant-time compare, rotate/revoke, every tool call audited | `test/core.test.ts`, `test/agent-mcp.test.ts` |
+| Sessions are hints: what a client says (session key, host, presence, Codex's `_meta.threadId`, a hook's params) only picks one of the token's own agent's sessions, checked for length and charset; another principal's sessions can't be addressed, `list_team` shows them as counts, `delivery` names only the agent | `Core.touchSession`, `AgentSession.sessionOf`, `listTeam`, `Core.delivery`; `UNIQUE (agent_id, key)` on `sessions` (migration 15) | `test/core.test.ts` "sessions", "addressing and delivery", "list_team" |
+| A message wakes a session at most once, never untargeted mail or a busy session; the wake notice carries only counts | `Core.claimWake` (one INSERT into `inbox_told`, per message and session), `AgentSession.wakes`; `clients/switchboard.mjs` builds the notice | `test/agent-mcp.test.ts` "GET /wait…", `test/clients.test.ts` |
+| Loop guard: agents' own messages capped per sender and recipient and per agent; humans, switchboard and the ops agent never | `Core.loopGuard` in `AgentSession.guarded` | `test/core.test.ts` "loop guard" |
 | Append-only log §12 | SQLite triggers on `events` | `test/core.test.ts` |
 | Window/incident threads always shared, DMs always private | `CHECK` constraints on `threads` | `test/core.test.ts` |
 | Slack cards are one line, capped at 300 characters; plans, rollbacks, verify steps and report evidence are never rendered (P2) | `card()` (`CARD_MAX`) and the card renderers in `slack.ts`; the slot summary's own budget in `windows.ts` | `test/slack.test.ts` "absurdly long plans, titles, evidence, resource names and notes…" |
@@ -59,15 +62,18 @@ Lower layers never import higher ones. `npm run check:arch` enforces the table b
 
 ## Data flow of one message
 
-1. An agent calls `send_message` → `agent-mcp.ts` → `AgentSession.sendMessage` checks mutes and picks or
-   creates the thread.
-2. `Core.append` writes the event and its inbox rows in one transaction (`db.tx`), then, after commit,
-   notifies listeners (`afterCommit`).
+1. An agent calls `send_message` → `agent-mcp.ts` → `AgentSession.sendMessage` (as the session its client named)
+   checks mutes and the loop guard, and picks or creates the thread.
+2. `Core.append` writes the event and its inbox rows in one transaction (`db.tx`), each targeting one of its agent's
+   sessions (`Core.target`: the session that last wrote in the thread, else an online idle one), then, after commit,
+   notifies listeners and held waits (`afterCommit`).
 3. Listeners: the Slack mirror (`SlackBridge.sync`, per-thread serial, retried by `sweep`; it posts what the ops
    agent and the core write, never an agent's text, P3) and the ops agent (`OpsAgent.schedule`, if the append wrote
    an `ops` inbox row per `wake.ts`).
-4. The recipient's hook hits `GET /unread`; the agent calls `read_inbox`. The inbox row is the truth;
-   hooks and sockets are only hints (P6).
+4. The recipient session's waiting client, holding `GET /wait`, gets a wake and wakes it (Claude Code: its `rewake`
+   Stop hook exits 2 with the notice; Codex: `codex queue`); a busy session is woken when its turn ends, and its hooks
+   hit `GET /unread`. The agent calls `read_inbox`. The inbox row is the truth; wakes, hooks and sockets are only hints
+   (P6).
 
 ## Rationale for the non-obvious choices
 
