@@ -201,6 +201,10 @@ try {
   await settle();
   assert.equal(slack.updates.filter((u) => u.ts === stdCard.ts).at(-1)!.text, ':calendar: Nightly maintenance 21:00–23:00 UTC. Approved by Bob.');
   log('P5 Alice\'s press on Bob\'s card is refused; Bob approves the schedule once, the card says so', slack.ephemerals.at(-1)!.text);
+  const offer = slack.posts.at(-1)!;
+  assert.equal(slack.posts.length, posts + 2, 'his approval offers Alice, who co-owns the gateway, a card to overrule it');
+  assert.match(offer.text, new RegExp(`^:calendar: <@${SLACK.alice}> You can now also approve or revoke nightly maintenance for .*It's approved already: nothing is needed\\.$`));
+  log('P5 either owner decides the slot: Bob\'s approval offers Alice Approve / Revoke for what she co-owns', offer.text);
 
   assert.equal((await call(scout, 'window_status', { resource: 'api-gateway' })).may_proceed, false);
   clock.t = Date.parse('2026-10-14T21:10:00Z'); sb.windows.tick();
@@ -210,10 +214,10 @@ try {
   log('P5 21:10: window_status may_proceed inside the approved slot', go.reason);
   await call(scout, 'report_window', { id: queued.change, outcome: 'done', evidence: 'gateway/health 200 on 1a2b' });
   await settle();
-  assert.equal(slack.posts.length, posts + 1, 'the report posts nothing');
+  assert.equal(slack.posts.length, posts + 2, 'the report posts nothing');
   clock.advance(140); sb.windows.tick(); // 23:30 = end + grace
   await settle();
-  const summary = slack.posts.slice(posts + 1);
+  const summary = slack.posts.slice(posts + 2);
   assert.equal(summary.length, 1);
   assert.ok(summary[0]!.text.length <= 300, 'the cap on system notices (P2)');
   assert.equal(primary.turns.length + failover.turns.length, turns, 'no ops turn for queued changes, approvals or the slot');

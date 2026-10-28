@@ -465,7 +465,11 @@ export class SlackBridge {
     });
     let text: string;
     let buttons: Block[] = [];
-    if (e.type === 'standing_requested') {
+    if (e.type === 'standing_requested' && r['already'] === true) {
+      // Pairs the other owner already approved (require any): an offer to overrule, not a request (P2).
+      text = `:calendar: ${this.mention(approver)} You can now also approve or revoke nightly maintenance for ${names} (${whose}). It's approved already: nothing is needed.`;
+      buttons = [button('approve', 'Approve', 'primary'), button('revoke', 'Revoke', 'danger')];
+    } else if (e.type === 'standing_requested') {
       const n = covers.length;
       text = r['extra'] === true
         ? `:calendar: ${this.mention(approver)} Nightly maintenance also needs your OK for ${names} (${whose}).`
@@ -473,12 +477,11 @@ export class SlackBridge {
       buttons = [button('approve', 'Approve', 'primary'), button('decline', 'Decline', 'danger')];
     } else if (e.type === 'standing_void') {
       text = `:calendar: ${slot}. Void: the slot moved to ${String(e.body['start'])}–${String(e.body['end'])} UTC.`;
-    } else if (e.body['decision'] === 'approve') {
-      text = `:calendar: ${slot}. Approved by ${who}.`;
-      buttons = [button('revoke', 'Revoke', 'danger')];
     } else {
-      text = `:calendar: ${slot}. ${e.body['decision'] === 'decline' ? 'Declined' : 'Revoked'} by ${who}.`;
-      buttons = [button('approve', 'Approve', 'primary')];
+      // Either owner's latest decision wins (Windows.coverage), so a decided card keeps both: Approve overrules a later
+      // revoke by the other owner, Revoke their later approval. A press that changes nothing is refused.
+      text = `:calendar: ${slot}. ${e.body['decision'] === 'approve' ? 'Approved' : e.body['decision'] === 'decline' ? 'Declined' : 'Revoked'} by ${who}.`;
+      buttons = [button('approve', 'Approve', 'primary'), button('revoke', 'Revoke', 'danger')];
     }
     return card(text, ...(buttons.length ? [{ type: 'actions', elements: buttons }] : []));
   }

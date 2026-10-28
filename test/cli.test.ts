@@ -85,9 +85,14 @@ test('admin ask-standing: posts a principal\'s standing card through the on-dema
   const again = await run(cfg, 'ask-standing', 'alice');
   assert.equal(again.code, 0);
   assert.match(again.out, /alice's card for schedule v1 was already posted.*nothing posted/);
-  const none = await run(cfg, 'ask-standing', 'bob'); // under this config only Alice approves anything
+  // Bob owns core-api too, so he decides it as well (either owner, require any); Carol owns nothing here.
+  await run(cfg, 'add-principal', 'carol', '--name', 'Carol', '--slack', SLACK.stranger);
+  const none = await run(cfg, 'ask-standing', 'carol');
   assert.equal(none.code, 1);
-  assert.match(none.out, /bob approves none of the configured resources/);
+  assert.match(none.out, /carol approves none of the configured resources/);
+  const offers = await run(cfg, 'ask-standing', 'bob', '--offers-only'); // nothing approved yet, so nothing to offer him
+  assert.equal(offers.code, 0, offers.out);
+  assert.match(offers.out, /nothing to offer bob: nobody else's approval covers what they can decide yet; nothing posted/);
   assert.equal((await run(cfg, 'ask-standing', 'nobody')).code, 1);
 
   // The service (another process) posts the card on its next sweep, as it would an on-demand one.
@@ -106,8 +111,10 @@ test('admin ask-standing: posts a principal\'s standing card through the on-dema
   assert.match((await run(cfg, 'ask-standing', 'alice')).out, /alice already approved schedule v1; nothing posted/);
   db = openDb(dbPath(config));
   const audited = db.prepare("SELECT actor, json_extract(detail, '$.principal') AS principal, json_extract(detail, '$.card') AS card FROM audit WHERE action = 'ask_standing' ORDER BY id").all().map((r) => ({ ...r }));
-  assert.deepEqual(audited, [['posted'], ['waiting'], ['approved']].map(([card]) => ({ actor: 'admin', principal: 'alice', card })));
-  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM standing_cards').get() as { n: number }).n, 1, 'one card: nothing new to approve');
+  assert.deepEqual(audited, [['alice', 'posted'], ['alice', 'waiting'], ['bob', 'nothing_to_approve'], ['alice', 'approved']].map(([principal, card]) => ({ actor: 'admin', principal, card })),
+    'every ask audited, the --offers-only one too');
+  assert.deepEqual(db.prepare('SELECT approver FROM standing_cards ORDER BY id').all().map((r) => r['approver']), ['alice', 'bob'],
+    'her card, and the offer her approval gave Bob, who co-owns core-api; nothing new for her');
   db.close();
 });
 
@@ -196,8 +203,8 @@ test('admin rerender-cards: the service rewrites every standing card and live ur
   assert.deepEqual(buttons(cardTs.approved), [':white_check_mark: API gateway, 16:00–16:30 UTC: `Restart the gateway`. Approved by Bob.', ['sb_win_decline']], 'until it starts, only the button that overrules it');
   assert.deepEqual(buttons(cardTs.active), [':construction: API gateway, 12:30–13:00 UTC: `Patch the gateway`. In progress until 13:00.', []]);
   assert.deepEqual(buttons(cardTs.legacy), [`:wrench: <@${SLACK.alice}> Core API and DB, 18:00–18:45 UTC: \`Raise API rate limits\` (scout, Alice's agent)`, ['sb_win_approve', 'sb_win_decline']]);
-  assert.deepEqual(buttons(cardTs.bob2), [':calendar: Nightly maintenance 22:00–00:00 UTC. Approved by Bob.', ['sb_std_revoke']]);
-  assert.deepEqual(buttons(cardTs.alice2), [':calendar: Nightly maintenance 22:00–00:00 UTC. Declined by Alice.', ['sb_std_approve']]);
+  assert.deepEqual(buttons(cardTs.bob2), [':calendar: Nightly maintenance 22:00–00:00 UTC. Approved by Bob.', ['sb_std_approve', 'sb_std_revoke']], 'a decided card keeps both: either owner can overrule');
+  assert.deepEqual(buttons(cardTs.alice2), [':calendar: Nightly maintenance 22:00–00:00 UTC. Declined by Alice.', ['sb_std_approve', 'sb_std_revoke']]);
   assert.deepEqual(buttons(cardTs.v1), [':calendar: Nightly maintenance 21:00–23:00 UTC. Void: the slot moved to 22:00–00:00 UTC.', []]);
   assert.ok(!rewrites.some((u) => u.ts === cardTs.declined), 'a decided window is left as it is');
   assert.equal(rewrites.length, 7, 'one rewrite per card Slack could edit');

@@ -252,18 +252,34 @@ export class Windows {
     if (!this.resources.has(resource.id) || !resource.owners.includes(principal)) return { covered: false, approvers, requireAll, missing: [] };
     const pair: CardPair = { resource: resource.id, principal, approvers, requireAll };
     const cards = this.cards();
+    if (!requireAll) {
+      // Either owner decides a require-any pair, and the latest decision wins: one can revoke what the other approved,
+      // and the other approve it again. Each decision is still a human's own button on their own card (P1).
+      const decides = (a: string) => resource.owners.includes(a) || approvers.includes(a);
+      const ids = cards.filter((c) => decides(c.approver) && c.covers.some((p) => samePair(p, pair))).map((c) => c.id);
+      const last = ids.length ? one<{ decision: StandingDecision }>(this.core.db,
+        `SELECT decision FROM standing_approvals WHERE card_id IN (${ids.map(() => '?').join(', ')}) ORDER BY id DESC LIMIT 1`, ...ids) : undefined;
+      const covered = last?.decision === 'approve';
+      return { covered, approvers, requireAll, missing: covered ? [] : approvers };
+    }
     const approved = approvers.filter((a) => cards.some((c) => c.approver === a && c.decision === 'approve' && c.covers.some((p) => samePair(p, pair))));
-    const covered = requireAll ? approved.length === approvers.length : approved.length > 0;
+    const covered = approved.length === approvers.length;
     return { covered, approvers, requireAll, missing: covered ? [] : approvers.filter((a) => !approved.includes(a)) };
   }
 
-  /** What one approver approves under the config: each pair policy() names them for, under its approvers and mode, with the others a require-all resource needs too. */
+  /**
+   * What one approver approves under the config: each pair policy() names them for, under its approvers and mode, with
+   * the others a require-all resource needs too; and every require-any pair of a resource they own, which either owner
+   * decides (coverage), under the approvers policy() names.
+   */
   covers(approver: string): Array<CardPair & { name: string; with: string[] }> {
     const out = [];
     for (const r of this.resources.values()) {
       for (const owner of r.owners) {
         const { approvers, requireAll } = this.policy(r, owner);
-        if (approvers.includes(approver)) out.push({ resource: r.id, name: r.name, principal: owner, approvers, requireAll, with: requireAll ? approvers.filter((a) => a !== approver) : [] });
+        if (approvers.includes(approver) || (!requireAll && r.owners.includes(approver))) {
+          out.push({ resource: r.id, name: r.name, principal: owner, approvers, requireAll, with: requireAll ? approvers.filter((a) => a !== approver) : [] });
+        }
       }
     }
     return out;
@@ -275,7 +291,7 @@ export class Windows {
    * one only for what a wider or looser config added. With `need`, only when that pair isn't on one of their cards. Says where the
    * card for `need` (or their newest card) stands.
    */
-  askStanding(approvers: string[], need?: Pair): Array<{ approver: string; card: CardState }> {
+  askStanding(approvers: string[], need?: Pair, options: { offersOnly?: boolean } = {}): Array<{ approver: string; card: CardState }> {
     return tx(this.core.db, () => {
       const s = this.schedule();
       const cards = this.cards(s.version);
@@ -291,22 +307,31 @@ export class Windows {
         const needed = need && wanted.find((p) => p.resource === need.resource && p.principal === need.principal);
         if (need && !needed) return { approver, card: 'nothing_to_approve' };
         if (missing.length && (!needed || !listed(needed))) {
-          const thread = this.core.createThread({
-            kind: 'chat', visibility: 'shared', title: `Nightly maintenance: ${principal.name}'s standing approval`, key: `standing:${s.version}:${approver}`,
-            participants: [principalActor(approver)],
-          });
-          const id = run(this.core.db, 'INSERT INTO standing_cards (version, approver, covers, thread_id, posted_at) VALUES (?, ?, ?, ?, ?)',
-            s.version, approver, JSON.stringify(missing.map((p) => [p.resource, p.principal, p.requireAll ? 'all' : 'any', [...p.approvers].sort()])), thread.id, this.core.iso()).lastInsertRowid;
-          // Grouped by resource for the card; the DB row is what the approval counts.
-          const byResource = new Map<string, { resource: string; name: string; principals: string[]; with: string[] }>();
-          for (const p of missing) {
-            const g = byResource.get(p.resource) ?? { resource: p.resource, name: p.name, principals: [], with: [] };
-            g.principals.push(p.principal);
-            g.with = [...new Set([...g.with, ...p.with])];
-            byResource.set(p.resource, g);
-          }
-          this.core.append(thread.id, 'system', 'standing_requested', {
-            card: id, version: s.version, approver, start: s.start, end: endOf(s), duration_minutes: s.duration_minutes, covers: [...byResource.values()], extra: mine.length > 0,
+          // Pairs the other owner's approval already covers (require any) go on a card of their own, an offer to
+          // overrule ("nothing is needed", Approve / Revoke); the rest on a request (Approve / Decline). So a Decline
+          // meant for what nobody approved yet can't take away what the other owner did.
+          const coveredPair = (p: CardPair) => !p.requireAll && this.coverage(this.resources.get(p.resource)!, p.principal).covered;
+          const groups = [options.offersOnly ? [] : missing.filter((p) => !coveredPair(p)), missing.filter(coveredPair)].filter((g) => g.length);
+          if (!groups.length) return { approver, card: 'nothing_to_approve' };
+          groups.forEach((group, i) => {
+            const thread = this.core.createThread({
+              kind: 'chat', visibility: 'shared', title: `Nightly maintenance: ${principal.name}'s standing approval`, key: `standing:${s.version}:${approver}`,
+              participants: [principalActor(approver)],
+            });
+            const id = run(this.core.db, 'INSERT INTO standing_cards (version, approver, covers, thread_id, posted_at) VALUES (?, ?, ?, ?, ?)',
+              s.version, approver, JSON.stringify(group.map((p) => [p.resource, p.principal, p.requireAll ? 'all' : 'any', [...p.approvers].sort()])), thread.id, this.core.iso()).lastInsertRowid;
+            // Grouped by resource for the card; the DB row is what the approval counts.
+            const byResource = new Map<string, { resource: string; name: string; principals: string[]; with: string[] }>();
+            for (const p of group) {
+              const g = byResource.get(p.resource) ?? { resource: p.resource, name: p.name, principals: [], with: [] };
+              g.principals.push(p.principal);
+              g.with = [...new Set([...g.with, ...p.with])];
+              byResource.set(p.resource, g);
+            }
+            this.core.append(thread.id, 'system', 'standing_requested', {
+              card: id, version: s.version, approver, start: s.start, end: endOf(s), duration_minutes: s.duration_minutes, covers: [...byResource.values()],
+              extra: mine.length > 0 || i > 0, already: group.every(coveredPair),
+            });
           });
           return { approver, card: 'posted' };
         }
@@ -406,10 +431,17 @@ export class Windows {
         throw new SwitchboardError('conflict', `this card is for an older maintenance time; it's now ${span(s)} UTC. A new card comes when a queued change needs it.`);
       }
       if (principal.id !== card.approver) throw new SwitchboardError('forbidden', `this card is ${this.core.principal(card.approver)?.name ?? card.approver}'s; only they can decide it.`);
-      const last = this.cards(s.version).find((c) => c.id === card.id)?.decision ?? null;
-      if (input.decision === 'approve' && last === 'approve') throw new SwitchboardError('conflict', 'you already approved this card.');
+      const mine = this.cards(s.version).find((c) => c.id === card.id)!;
+      const last = mine.decision;
+      // The latest decision wins for a require-any pair (coverage), so a card's Approve or Revoke can overrule the
+      // other owner's; a press that would change nothing is refused.
+      const anyPairs = mine.covers.filter((p) => !p.requireAll && this.resources.has(p.resource));
+      const coveredNow = anyPairs.map((p) => this.coverage(this.resources.get(p.resource)!, p.principal).covered);
+      if (input.decision === 'approve' && last === 'approve' && coveredNow.every(Boolean)) {
+        throw new SwitchboardError('conflict', 'you already approved this card, and it covers all of these.');
+      }
       if (input.decision === 'decline' && last) throw new SwitchboardError('conflict', last === 'approve' ? 'you approved this card; press Revoke to withdraw it.' : 'this card isn\'t approved.');
-      if (input.decision === 'revoke' && last !== 'approve') throw new SwitchboardError('conflict', 'nothing to revoke: this card isn\'t approved.');
+      if (input.decision === 'revoke' && last !== 'approve' && !coveredNow.some(Boolean)) throw new SwitchboardError('conflict', 'nothing to revoke: none of these is covered now.');
       const covered = this.coveredNow();
       run(this.core.db, 'INSERT INTO standing_approvals (card_id, approver, slack_user_id, decision, decided_at) VALUES (?, ?, ?, ?, ?)',
         card.id, principal.id, input.slackUserId, input.decision, this.core.iso());
@@ -417,6 +449,14 @@ export class Windows {
         card: card.id, version: s.version, approver: principal.id, decision: input.decision, start: s.start, end: endOf(s),
       });
       this.steerLost(covered);
+      // An approval covers the other owners' require-any pairs too: give each of them an offer card for what they can
+      // now overrule, once per version (askStanding posts only pairs none of their cards lists yet).
+      if (input.decision === 'approve') {
+        const others = new Set(mine.covers.filter((p) => !p.requireAll && this.resources.has(p.resource))
+          .flatMap((p) => [...this.resources.get(p.resource)!.owners, ...p.approvers]));
+        others.delete(principal.id);
+        if (others.size) this.askStanding([...others].filter((o) => this.core.principal(o)), undefined, { offersOnly: true });
+      }
       return { text: `${input.decision === 'approve' ? 'Approved' : input.decision === 'decline' ? 'Declined' : 'Revoked'}: nightly maintenance ${span(s)} UTC.` };
     });
   }

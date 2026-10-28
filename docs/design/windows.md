@@ -28,9 +28,16 @@ Advisory (P1): agents check `window_status`; enforcement belongs in the systems 
   approve, decline, revoke; the latest counts), each from that approver's own Slack user (P1).
 - **Cards on demand.** An approver's card is posted the first time a change needs their approval and they have no
   card for the current version, or when an operator runs `node src/cli.ts admin ask-standing <principal>` to let them
-  approve ahead. It covers every (resource, principal) pair `policy` names them for, as of posting, with Approve /
-  Decline. Those pairs are stored with the card (`standing_cards.covers`) and never change; the card itself is one
-  line that says how many resources and whose agents (P2), and `list_maintenance` lists the pairs in full. A decision rewrites it in place: approved shows Revoke; declined or revoked shows Approve.
+  approve ahead. It covers every (resource, principal) pair `policy` names them for, and every `require: any` pair of a
+  resource they own (either owner decides those), as of posting, with Approve / Decline. Those pairs are stored with the
+  card (`standing_cards.covers`) and never change; the card itself is one line that says how many resources and whose
+  agents (P2), and `list_maintenance` lists the pairs in full. A card whose pairs the other owner's approval already
+  covers says so ("It's approved already: nothing is needed") and offers Approve and Revoke instead, so nobody declines
+  it by mistake; such pairs never share a card with ones nobody approved yet, so a Decline meant for those can't take
+  away what the other owner approved. When one owner approves, each other owner gets that offer card for what they can
+  now overrule (once per version: only pairs none of their cards lists). A decision rewrites the card in place, and a
+  decided card keeps both Approve and Revoke: the other owner's later decision can always be overruled from it. A
+  press that would change nothing is refused.
 - **A wider config needs a new card.** The version doesn't change when config does, so a restart with a new
   resource, or a new approver, could otherwise widen an approval the approver never saw. An approval counts only
   for the pairs its card listed, and only under the approvers and require mode each pair had on the card: a config
@@ -42,9 +49,12 @@ Advisory (P1): agents check `window_status`; enforcement belongs in the systems 
   by resource and by change id alike (`coverage` checks config and ownership first). (Chosen
   over a per-approver version: it needs no second versioning scheme, and a card stays one approval of what it
   showed.)
-- **Coverage.** The slot covers resource R for an agent of principal P when R is in config, P owns it, and the
-  approvers `policy(R, P)` gives have, for the current version, approved a card that lists (R, P) under those
-  approvers and mode: one of them for `require: any`, all of them for `require: all`.
+- **Coverage.** The slot covers resource R for an agent of principal P when R is in config and P owns it, and:
+  for `require: all`, every approver `policy(R, P)` gives has, for the current version, approved a card that lists
+  (R, P) under those approvers and mode; for `require: any`, the latest decision (approve, decline or revoke) on the
+  current version's cards that list (R, P) under those approvers and mode, by any owner of R or approver, is an
+  approve. So either owner can revoke what the other approved, and the other approve it again; each decision is
+  still that human's own button on their own card (P1).
 - **Agents queue changes.** `request_window` without `urgent` queues a change (`c_<12 hex>`) for the next slot
   whose end is still in the future (the current one while it runs), with that slot's times. A new time ends the slot, now, for a
   queued change the slot covered and that had started (it may be halfway done: it reports there, and tonight's

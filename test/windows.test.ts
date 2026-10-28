@@ -675,11 +675,14 @@ describe('the nightly maintenance slot (P5)', () => {
     assert.equal(windows.coverage(gateway, 'alice').covered, true, 'require any: Bob\'s approval covers the gateway for Alice\'s agents');
     assert.equal(windows.coverage(gateway, 'bob').covered, true);
     assert.deepEqual(windows.coverage(windows.resource('main-db'), 'alice'), { covered: false, approvers: ['alice', 'bob'], requireAll: true, missing: ['alice'] }, 'require all: Alice must approve too');
-    assert.equal(slack.posts.length, 1, 'the decision rewrites the card');
+    assert.equal(slack.posts.filter((p) => p.text.includes(`<@${SLACK.bob}>`)).length, 1, 'the decision rewrites his card');
+    assert.equal(slack.posts.at(-1)!.text, `:calendar: <@${SLACK.alice}> You can now also approve or revoke nightly maintenance for API gateway (Alice's and Bob's agents). It's approved already: nothing is needed.`,
+      'Alice co-owns the gateway (require any): his approval offers her a card to overrule it');
     const approved = slack.updates.at(-1)!;
     assert.equal(approved.ts, card.ts);
     assert.equal(approved.text, ':calendar: Nightly maintenance 21:00–23:00 UTC. Approved by Bob.');
-    assert.deepEqual(((approved.blocks!.find((b) => b['type'] === 'actions') as { elements: Array<{ action_id: string }> }).elements).map((e) => e.action_id), ['sb_std_revoke']);
+    assert.deepEqual(((approved.blocks!.find((b) => b['type'] === 'actions') as { elements: Array<{ action_id: string }> }).elements).map((e) => e.action_id), ['sb_std_approve', 'sb_std_revoke'],
+      'both: the other owner\'s later decision can be overruled from this card');
     assert.throws(() => core.db.prepare("UPDATE standing_approvals SET decision = 'revoke'").run(), /append-only/);
     assert.throws(() => core.db.prepare('DELETE FROM standing_approvals').run(), /append-only/);
 
@@ -687,9 +690,73 @@ describe('the nightly maintenance slot (P5)', () => {
     await settle();
     assert.equal(windows.coverage(gateway, 'alice').covered, false, 'revoked');
     assert.equal(slack.updates.at(-1)!.text, ':calendar: Nightly maintenance 21:00–23:00 UTC. Revoked by Bob.');
-    assert.deepEqual(((slack.updates.at(-1)!.blocks!.find((b) => b['type'] === 'actions') as { elements: Array<{ action_id: string }> }).elements).map((e) => e.action_id), ['sb_std_approve'], 'and can approve again');
+    assert.deepEqual(((slack.updates.at(-1)!.blocks!.find((b) => b['type'] === 'actions') as { elements: Array<{ action_id: string }> }).elements).map((e) => e.action_id), ['sb_std_approve', 'sb_std_revoke'], 'and can approve again');
     assert.deepEqual(core.db.prepare('SELECT approver, slack_user_id, decision FROM standing_approvals ORDER BY id').all().map((r) => ({ ...r })),
       [{ approver: 'bob', slack_user_id: SLACK.bob, decision: 'approve' }, { approver: 'bob', slack_user_id: SLACK.bob, decision: 'revoke' }]);
+  });
+
+  test('either owner decides a require-any pair of the slot, and the latest decision wins; require all is unchanged', async () => {
+    const t = setup();
+    const gateway = t.windows.resource('api-gateway'); // owners alice and bob; the config names bob
+    const db = t.windows.resource('main-db'); // require all: alice and bob
+    t.windows.askStanding(['bob', 'alice']);
+    await t.settle();
+    const aliceCovers = t.windows.maintenance().standing.find((c) => c.approver === 'alice')!.covers;
+    assert.ok(aliceCovers.includes('api-gateway for alice\'s agents') && aliceCovers.includes('api-gateway for bob\'s agents'), 'alice owns the gateway, so her card lists it too');
+    const covered = () => [t.windows.coverage(gateway, 'alice').covered, t.windows.coverage(gateway, 'bob').covered, t.windows.coverage(db, 'alice').covered];
+    await t.standing(1, 'bob', SLACK.bob);
+    await t.standing(1, 'alice', SLACK.alice);
+    assert.deepEqual(covered(), [true, true, true], 'both approved');
+    await t.standing(1, 'alice', SLACK.alice, 'revoke');
+    assert.deepEqual(covered(), [false, false, false], 'alice revokes: the gateway follows her, the main DB needs both');
+    await t.standing(1, 'bob', SLACK.bob);
+    assert.deepEqual(covered(), [true, true, false], 'bob overrules her for the gateway from the card he had approved; her revoke stands for the main DB');
+    await t.standing(1, 'bob', SLACK.bob);
+    assert.match(t.slack.ephemerals.at(-1)!.text, /already approved this card, and it covers all of these/, 'a press that changes nothing is refused');
+    await t.standing(1, 'alice', SLACK.alice, 'revoke');
+    assert.deepEqual(covered(), [false, false, false], 'and she overrules him in turn');
+    await t.standing(1, 'alice', SLACK.alice, 'revoke');
+    assert.match(t.slack.ephemerals.at(-1)!.text, /nothing to revoke/);
+    const rows = t.core.db.prepare('SELECT approver, decision FROM standing_approvals ORDER BY id').all().map((r) => ({ ...r }));
+    assert.deepEqual(rows.map((r) => `${r['approver']} ${r['decision']}`), ['bob approve', 'alice approve', 'alice revoke', 'bob approve', 'alice revoke']);
+  });
+
+  test('an owner\'s new cards split what the other owner already approved (an offer: Approve / Revoke) from what nobody has (a request), and either can overrule', async () => {
+    const t = setup();
+    const gateway = t.windows.resource('api-gateway');
+    t.windows.askStanding(['bob']);
+    await t.settle();
+    await t.standing(1, 'bob', SLACK.bob);
+    assert.equal(t.windows.coverage(gateway, 'alice').covered, true);
+    t.windows.askStanding(['alice']);
+    await t.settle();
+    const [offer, request] = t.slack.posts.slice(-2); // the offer came with Bob's approval; the request when she was asked
+    assert.equal(request!.text, `:calendar: <@${SLACK.alice}> Nightly maintenance also needs your OK for Main DB and Alice's staging box (Alice's and Bob's agents).`,
+      'what nobody approved yet, on a card after her offer, so it names them');
+    assert.equal(offer!.text, `:calendar: <@${SLACK.alice}> You can now also approve or revoke nightly maintenance for API gateway (Alice's and Bob's agents). It's approved already: nothing is needed.`);
+    await t.bridge.onAction({ actionId: 'sb_std_decline', value: buttonValue(request!, 'sb_std_decline'), user: SLACK.alice, channel: SLACK.ops, messageTs: request!.ts });
+    assert.equal(t.windows.coverage(gateway, 'alice').covered, true, 'declining the request leaves what Bob approved alone');
+    await t.bridge.onAction({ actionId: 'sb_std_revoke', value: buttonValue(offer!, 'sb_std_revoke'), user: SLACK.alice, channel: SLACK.ops, messageTs: offer!.ts });
+    assert.equal(t.windows.coverage(gateway, 'alice').covered, false, 'her Revoke on the offer overrules his approval');
+  });
+
+  test('a card for pairs the other owner already approved says so, and offers Approve and Revoke, not a request (P2)', async () => {
+    const t = setup();
+    const shared: Resource = { id: 'shared-deploy', name: 'Shared deploys', owners: ['alice', 'bob'], approvers: ['bob'], require: 'any', max_duration_minutes: 60 };
+    const w = new Windows(t.core, [shared]);
+    w.askStanding(['bob']);
+    await t.settle();
+    await t.standing(1, 'bob', SLACK.bob);
+    assert.equal(w.coverage(shared, 'alice').covered, true);
+    w.askStanding(['alice']);
+    await t.settle();
+    const card = t.slack.posts.at(-1)!;
+    assert.equal(card.text, `:calendar: <@${SLACK.alice}> You can now also approve or revoke nightly maintenance for Shared deploys (Alice's and Bob's agents). It's approved already: nothing is needed.`);
+    const ids = ((card.blocks!.find((b) => b['type'] === 'actions') as { elements: Array<{ action_id: string }> }).elements).map((e) => e.action_id);
+    assert.deepEqual(ids, ['sb_std_approve', 'sb_std_revoke'], 'Revoke, not Decline: pressing it takes the slot away from both sides');
+    // The fixture's bridge serves the fixture's resources; this config's Windows decides its own card.
+    w.decideStandingFromSlackButton({ cardId: (JSON.parse(buttonValue(card, 'sb_std_revoke')) as { k: number }).k, slackUserId: SLACK.alice, decision: 'revoke' });
+    assert.equal(w.coverage(shared, 'alice').covered, false, 'her Revoke overrules his approval');
   });
 
   test('a standing approval covers only the resource and principal pairs its card listed: a wider config needs a new card for the new pairs', async () => {
@@ -707,7 +774,7 @@ describe('the nightly maintenance slot (P5)', () => {
     assert.match(r.next, /bob's standing approval is missing: their card was just posted in #ops/);
     await t.settle();
     const extra = t.slack.posts.at(-1)!;
-    assert.equal(t.slack.posts.length, 2, 'a second card, only for what is new');
+    assert.equal(t.slack.posts.filter((p) => p.text.includes(`<@${SLACK.bob}>`)).length, 2, 'a second card for Bob, only for what is new');
     assert.equal(extra.text, `:calendar: <@${SLACK.bob}> Nightly maintenance also needs your OK for backend deploys (Alice's and Bob's agents).`);
     assert.doesNotMatch(extra.text, /API gateway|Main DB/, 'not what his first card already listed');
     await t.bridge.onAction({ actionId: 'sb_std_approve', value: buttonValue(extra, 'sb_std_approve'), user: SLACK.bob, channel: SLACK.ops, messageTs: extra.ts });
@@ -716,7 +783,7 @@ describe('the nightly maintenance slot (P5)', () => {
     assert.equal(t.slack.updates.at(-1)!.text, ':calendar: Nightly maintenance 21:00–23:00 UTC, also for backend deploys. Approved by Bob.');
     wider.queue(t.agents.builder, { resource: 'backend-deploy', plan: 'deploy', rollback: 'revert', verify: 'curl' });
     await t.settle();
-    assert.equal(t.slack.posts.length, 2, 'nothing new to approve, nothing posted');
+    assert.equal(t.slack.posts.filter((p) => p.text.includes(`<@${SLACK.bob}>`)).length, 2, 'nothing new to approve, nothing posted');
   });
 
   test('a standing card is one line however many resources it covers; a supplementary one names them inline, clipped with "and N more" (P2)', async () => {
@@ -797,7 +864,7 @@ describe('the nightly maintenance slot (P5)', () => {
     assert.deepEqual([r.changed, r.schedule.version, r.schedule.start], [true, 2, '22:00']);
     assert.equal(windows.coverage(gateway, 'alice').covered, false, 'void: a standing approval is for one version');
     await settle();
-    const notices = slack.posts.filter((p) => !p.threadTs && p !== card);
+    const notices = slack.posts.filter((p) => !p.threadTs && p !== card && !/^:calendar:/.test(p.text)); // cards aren't announcements
     assert.equal(notices.length, 1, 'one announcement');
     assert.equal(notices[0]!.text, 'Nightly maintenance is now 22:00–00:00 UTC (was 21:00–23:00); the next slot starts Oct 14 22:00 UTC. Standing approvals for the old time are void; each approver gets a new card when a queued change needs one.');
     assert.equal((notices[0]!.blocks ?? []).at(-1)?.['type'], 'context', 'a system notice with the footer');
@@ -855,7 +922,8 @@ describe('queued changes (P5)', () => {
     t.windows.queue(t.agents.scout, { resource: 'alice-box', ...change });
     await t.settle();
     assert.equal(t.slack.posts.length, 2, 'a change that needs another approver posts their card');
-    assert.equal(t.slack.posts[1]!.text, `:calendar: <@${SLACK.alice}> Nightly maintenance 21:00–23:00 UTC for 2 shared resources (Alice's and Bob's agents). Approve once?`);
+    assert.equal(t.slack.posts[1]!.text, `:calendar: <@${SLACK.alice}> Nightly maintenance 21:00–23:00 UTC for 3 shared resources (Alice's and Bob's agents). Approve once?`,
+      'every resource she can decide: the API gateway too, which either owner decides (require any)');
 
     // A new time voids the approvals; the queued changes ask again, once per approver.
     t.windows.setSchedule({ start: '22:00', duration_minutes: 120 }, 'ops');

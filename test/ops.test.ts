@@ -1090,7 +1090,8 @@ describe('ops tools', () => {
     await settle();
     assert.deepEqual(seen.schedule, { version: 1, start: '21:00', end: '23:00', duration_minutes: 120, set_by: 'config', since: '2026-10-14T12:00:00.000Z' });
     assert.equal(seen.next_slot.day, '2026-10-15');
-    assert.deepEqual(seen.standing.map((x: { approver: string; decision: string }) => [x.approver, x.decision]), [['bob', 'approve'], ['alice', 'undecided']], 'every card, decided or not');
+    assert.deepEqual(seen.standing.map((x: { approver: string; decision: string }) => [x.approver, x.decision]), [['bob', 'approve'], ['alice', 'undecided'], ['alice', 'undecided']],
+      'every card, decided or not: Bob\'s approval offered Alice the API gateway (either owner decides), and her box needed a request');
     assert.deepEqual(seen.standing[0].covers, ["api-gateway for alice's agents", "api-gateway for bob's agents", "main-db for alice's agents", "main-db for bob's agents"]);
     assert.deepEqual(seen.changes.map((x: { resource: string; state: string; covered: boolean }) => [x.resource, x.state, x.covered]), [['alice-box', 'queued', false]], 'summarized slots drop out');
     assert.match(slack.posts.filter((p) => p.threadTs === '500.1').map((p) => p.text).join(), /Tonight 21:00–23:00 UTC: 1 change\(s\) queued\./);
